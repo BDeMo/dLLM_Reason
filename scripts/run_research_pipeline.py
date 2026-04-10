@@ -433,25 +433,48 @@ def _stage2_search(
                          f"Available: {available}")
     searcher_cls = SEARCH_REGISTRY.get(search_method)
 
-    # Searcher kwargs — use template warm-start for greedy/evolutionary
+    # Searcher kwargs — map CLI args to each searcher's __init__ params
     searcher_kwargs = {}
     if search_method == "greedy":
         searcher_kwargs = {
             "init_templates": list(TEMPLATE_NAMES),
-            "num_candidates": 10,
-            "patience": 5,
+            "num_candidates": args.s2_greedy_candidates,
+            "patience": args.s2_greedy_patience,
         }
     elif search_method == "evolutionary":
         searcher_kwargs = {
             "init_templates": list(TEMPLATE_NAMES),
-            "population_size": min(20, budget // 2),
+            "population_size": min(args.s2_evo_pop_size, budget // 2),
+            "mutation_rate": args.s2_evo_mutation_rate,
+            "crossover_rate": args.s2_evo_crossover_rate,
         }
-    elif search_method == "differentiable":
-        searcher_kwargs = {"lr": 1e-3}
     elif search_method == "rl_policy":
         searcher_kwargs = {
             "max_seq_len": args.gen_length,
-            "hidden_dim": 128,
+            "hidden_dim": args.s2_rl_hidden_dim,
+            "lr": args.s2_rl_lr,
+            "max_edges_per_dag": args.s2_rl_max_edges,
+        }
+    elif search_method == "differentiable":
+        searcher_kwargs = {
+            "lr": args.s2_diff_lr,
+            "rho_init": args.s2_diff_rho_init,
+        }
+    elif search_method == "nas":
+        from dllm_reason.search.nas_search import NASConfig
+        searcher_kwargs = {
+            "config": NASConfig(
+                mode=args.s2_nas_mode,
+                span_size=args.s2_nas_span_size,
+            ),
+        }
+    elif search_method == "e2e":
+        from dllm_reason.search.e2e_dag_learner import E2EConfig
+        searcher_kwargs = {
+            "config": E2EConfig(
+                lr_dag=args.s2_e2e_lr,
+                sparsity_weight=args.s2_e2e_sparsity,
+            ),
         }
 
     for ds in args.datasets:
@@ -911,6 +934,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Search algorithm (only if --s2_method=search)")
     p.add_argument("--s2_search_budget", type=int, default=50,
                     help="Search budget per prompt (only if --s2_method=search)")
+
+    # ── Stage 2 search: per-method options ──
+    # Category A: Discrete local search (greedy)
+    p.add_argument("--s2_greedy_candidates", type=int, default=10,
+                    help="[greedy] Edge candidates per step")
+    p.add_argument("--s2_greedy_patience", type=int, default=5,
+                    help="[greedy] Stop after N steps without improvement")
+
+    # Category B: Population-based search (evolutionary)
+    p.add_argument("--s2_evo_pop_size", type=int, default=20,
+                    help="[evolutionary] Population size")
+    p.add_argument("--s2_evo_mutation_rate", type=float, default=0.3,
+                    help="[evolutionary] Mutation probability per generation")
+    p.add_argument("--s2_evo_crossover_rate", type=float, default=0.5,
+                    help="[evolutionary] Crossover probability per generation")
+
+    # Category C: Policy gradient search (rl_policy)
+    p.add_argument("--s2_rl_hidden_dim", type=int, default=128,
+                    help="[rl_policy] Policy network hidden dimension")
+    p.add_argument("--s2_rl_lr", type=float, default=1e-4,
+                    help="[rl_policy] Policy learning rate")
+    p.add_argument("--s2_rl_max_edges", type=int, default=50,
+                    help="[rl_policy] Max edges per constructed DAG")
+
+    # Category D: Continuous relaxation (differentiable)
+    p.add_argument("--s2_diff_lr", type=float, default=1e-3,
+                    help="[differentiable] Learning rate for edge params")
+    p.add_argument("--s2_diff_rho_init", type=float, default=1.0,
+                    help="[differentiable] Initial NOTEARS rho")
+
+    # Category E: Architecture search (nas)
+    p.add_argument("--s2_nas_mode", type=str, default="supernet",
+                    choices=["supernet", "controller"],
+                    help="[nas] supernet (DARTS-like) or controller (ENAS-like)")
+    p.add_argument("--s2_nas_span_size", type=int, default=16,
+                    help="[nas] Tokens per span (reduces search space)")
+
+    # Category F: End-to-end differentiable (e2e)
+    p.add_argument("--s2_e2e_lr", type=float, default=3e-3,
+                    help="[e2e] DAG parameter learning rate")
+    p.add_argument("--s2_e2e_sparsity", type=float, default=0.01,
+                    help="[e2e] L1 sparsity weight on edge probabilities")
 
     # ── Stage 3: Training ──
     p.add_argument("--checkpoint", type=str, default="GSAI-ML/LLaDA-8B-Instruct",
