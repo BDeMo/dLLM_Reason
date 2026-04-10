@@ -75,7 +75,10 @@ FLAT_STRATEGIES = {"confidence", "random", "linear", "entropy", "semi_ar",
                    "adaptive_dynamic"}
 
 # DAG template priority (higher = preferred when multiple are correct)
+# Search-discovered DAGs get highest priority (they explored the full space).
 DAG_PRIORITY = {
+    "search_differentiable": 10, "search_evolutionary": 9,
+    "search_greedy": 8, "search_rl_policy": 8,
     "cot": 4, "skeleton": 3, "bidirectional": 2, "answer_first": 1,
 }
 
@@ -393,17 +396,63 @@ def _stage2_search(
     args: argparse.Namespace,
     out: Path,
 ):
-    """Per-prompt DAG search (local model, not through API).
+    """Per-prompt DAG search using real search algorithms.
 
-    Requires local model loading. Supports greedy, evolutionary,
-    rl_policy, and differentiable search methods.
+    Uses the DAGSearcher implementations (greedy, evolutionary,
+    rl_policy, differentiable) from dllm_reason.search to search
+    over the full DAG adjacency matrix space.
+
+    For each prompt, builds an eval_fn that generates with a given DAG
+    and scores the output, then hands it to the selected searcher.
     """
+    print(f"  [SEARCH] method={args.s2_search_method}  "
+          f"budget={args.s2_search_budget}")
     print("  [SEARCH] Loading model locally for per-prompt search...")
     model = _load_model_local(args)
     device = model.device
 
-    from dllm_reason.inference.sampler import DiffusionSampler, SamplingConfig
     from dllm_reason.graph.dag import TokenDAG
+    from dllm_reason.graph.templates import TEMPLATE_NAMES
+    from dllm_reason.search import SEARCH_REGISTRY
+
+    # Import all search modules so they register themselves
+    import dllm_reason.search.greedy          # noqa: F401
+    import dllm_reason.search.evolutionary    # noqa: F401
+    import dllm_reason.search.rl_policy       # noqa: F401
+    import dllm_reason.search.differentiable  # noqa: F401
+    import dllm_reason.search.nas_search      # noqa: F401
+    import dllm_reason.search.e2e_dag_learner # noqa: F401
+
+    search_method = args.s2_search_method
+    budget = args.s2_search_budget
+
+    # Build the searcher instance with template warm-start
+    if search_method not in SEARCH_REGISTRY:
+        available = ", ".join(SEARCH_REGISTRY.keys())
+        raise ValueError(f"Unknown search method '{search_method}'. "
+                         f"Available: {available}")
+    searcher_cls = SEARCH_REGISTRY.get(search_method)
+
+    # Searcher kwargs — use template warm-start for greedy/evolutionary
+    searcher_kwargs = {}
+    if search_method == "greedy":
+        searcher_kwargs = {
+            "init_templates": list(TEMPLATE_NAMES),
+            "num_candidates": 10,
+            "patience": 5,
+        }
+    elif search_method == "evolutionary":
+        searcher_kwargs = {
+            "init_templates": list(TEMPLATE_NAMES),
+            "population_size": min(20, budget // 2),
+        }
+    elif search_method == "differentiable":
+        searcher_kwargs = {"lr": 1e-3}
+    elif search_method == "rl_policy":
+        searcher_kwargs = {
+            "max_seq_len": args.gen_length,
+            "hidden_dim": 128,
+        }
 
     for ds in args.datasets:
         data = load_reasoning_dataset(ds, split="test")
@@ -417,54 +466,95 @@ def _stage2_search(
             if item["question"] in existing_prompts:
                 continue
 
-            print(f"    [{idx+1}/{len(data)}] Searching DAG for prompt...")
+            prompt_text = item["question"]
+            ground_truth = item["answer"]
 
-            # Try each template as a candidate
-            from dllm_reason.graph.templates import build_template, TEMPLATE_NAMES
-            best_score = -1.0
-            best_ep = None
+            print(f"    [{idx+1}/{len(data)}] {search_method} search "
+                  f"(budget={budget}) ...")
 
-            for tname in TEMPLATE_NAMES:
-                try:
-                    dag = build_template(tname, args.gen_length, device)
-                except Exception:
-                    continue
+            # Build eval_fn: (model, dag) -> fitness score
+            def make_eval_fn(prompt, gt, dataset_name):
+                def eval_fn(mdl, dag):
+                    from dllm_reason.scheduler.dag_scheduler import DAGScheduler
+                    scheduler = DAGScheduler(dag, sub_strategy="confidence_topk")
+                    text = mdl.generate(
+                        prompt=prompt,
+                        generation_len=args.gen_length,
+                        block_length=args.block_length,
+                        scheduler=scheduler,
+                        num_steps=args.num_steps,
+                        temperature=args.temperature,
+                    )
+                    ok, score, _ = auto_eval(text, gt, dataset_name)
+                    return score
+                return eval_fn
 
-                from dllm_reason.scheduler.dag_scheduler import DAGScheduler
-                scheduler = DAGScheduler(dag, sub_strategy="confidence_topk")
+            eval_fn = make_eval_fn(prompt_text, ground_truth, ds)
 
-                text = model.generate(
-                    prompt=item["question"],
-                    generation_len=args.gen_length,
-                    block_length=args.block_length,
-                    scheduler=scheduler,
-                    num_steps=args.num_steps,
-                    temperature=args.temperature,
-                )
+            # Run the search
+            searcher = searcher_cls(**searcher_kwargs)
+            result = searcher.search(
+                model=model,
+                eval_fn=eval_fn,
+                seq_len=args.gen_length,
+                budget=budget,
+            )
 
-                ok, score, comment = auto_eval(text, item["answer"], ds)
-                ep = DAGEpisode(
-                    episode_id=str(uuid.uuid4()),
-                    prompt=item["question"],
-                    task_type=ds,
-                    ground_truth=item["answer"],
-                    strategy_name=tname,
-                    model_id=args.checkpoint,
-                    output=text,
-                    correct=ok,
-                    score=score,
-                    comment=comment,
-                    dag_seq_len=args.gen_length,
-                    dag_adjacency=dag.adj.cpu().int().tolist(),
-                    num_steps=args.num_steps,
-                    block_length=args.block_length,
-                    temperature=args.temperature,
-                )
-                store.add(ep)
+            # Generate with the best DAG to get the final output
+            from dllm_reason.scheduler.dag_scheduler import DAGScheduler
+            best_scheduler = DAGScheduler(
+                result.best_dag, sub_strategy="confidence_topk")
+            best_text = model.generate(
+                prompt=prompt_text,
+                generation_len=args.gen_length,
+                block_length=args.block_length,
+                scheduler=best_scheduler,
+                num_steps=args.num_steps,
+                temperature=args.temperature,
+            )
+            ok, score, comment = auto_eval(best_text, ground_truth, ds)
 
-                if score > best_score:
-                    best_score = score
-                    best_ep = ep
+            # Store the result
+            ep = DAGEpisode(
+                episode_id=str(uuid.uuid4()),
+                prompt=prompt_text,
+                task_type=ds,
+                ground_truth=ground_truth,
+                strategy_name=f"search_{search_method}",
+                model_id=args.checkpoint,
+                output=best_text,
+                correct=ok,
+                score=score,
+                comment=comment,
+                dag_seq_len=args.gen_length,
+                dag_adjacency=result.best_dag.adjacency.cpu().int().tolist(),
+                num_steps=args.num_steps,
+                block_length=args.block_length,
+                temperature=args.temperature,
+            )
+            store.add(ep)
+
+            # Also save search history per prompt
+            history_path = out / "search_histories" / ds
+            history_path.mkdir(parents=True, exist_ok=True)
+            save_json(history_path / f"prompt_{idx:04d}.json", {
+                "prompt": prompt_text[:200],
+                "ground_truth": ground_truth,
+                "search_method": search_method,
+                "budget": budget,
+                "best_fitness": result.best_fitness,
+                "best_dag_edges": result.best_dag.num_edges(),
+                "best_dag_depth": result.best_dag.depth(),
+                "correct": ok,
+                "score": score,
+                "history": result.history,
+                "metadata": result.metadata,
+            })
+
+            print(f"      -> fitness={result.best_fitness:.3f}  "
+                  f"edges={result.best_dag.num_edges()}  "
+                  f"depth={result.best_dag.depth()}  "
+                  f"correct={ok}")
 
 
 def _select_best_dag_per_prompt(store: EpisodeStore, args: argparse.Namespace) -> dict:
@@ -816,7 +906,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="DAG discovery method")
     # Options: sweep (try all templates), search (per-prompt search)
     p.add_argument("--s2_search_method", type=str, default="greedy",
-                    choices=["greedy", "evolutionary", "rl_policy", "differentiable"],
+                    choices=["greedy", "evolutionary", "rl_policy",
+                             "differentiable", "nas", "e2e"],
                     help="Search algorithm (only if --s2_method=search)")
     p.add_argument("--s2_search_budget", type=int, default=50,
                     help="Search budget per prompt (only if --s2_method=search)")
