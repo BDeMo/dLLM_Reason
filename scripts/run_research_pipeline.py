@@ -74,11 +74,35 @@ FLAT_STRATEGIES = {"confidence", "random", "linear", "entropy", "semi_ar",
                    "maskgit_cosine", "critical_token_first", "curriculum",
                    "adaptive_dynamic"}
 
-# DAG template priority (higher = preferred when multiple are correct)
-# Search-discovered DAGs get highest priority (they explored the full space).
+# ── Search Level Taxonomy ─────────────────────────────────────────────────────
+#
+# Level  Name              Method            Space (n=128)    CLI value
+# ─────  ────────────────  ────────────────  ──────────────   ─────────────
+#  L0    Enumerate         Template sweep    8                (--s2_method sweep)
+#  L1    Perturb           Greedy edge       ~10^2            greedy
+#  L2    Evolve            Evolutionary      ~10^3            evolutionary
+#  L3    Construct         RL policy         ~10^4            rl_policy
+#  L4    Relax             Differentiable    R^(n^2)          differentiable
+#  L5    Architect         NAS span-level    R^((n/s)^2)      nas
+#  L6    Learn             E2E joint         R^(n^2)+reg      e2e
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEARCH_LEVELS = {
+    "sweep":          {"level": 0, "name": "Enumerate",  "method": "Template sweep"},
+    "greedy":         {"level": 1, "name": "Perturb",    "method": "Greedy edge search"},
+    "evolutionary":   {"level": 2, "name": "Evolve",     "method": "Population evolution"},
+    "rl_policy":      {"level": 3, "name": "Construct",  "method": "RL policy construction"},
+    "differentiable": {"level": 4, "name": "Relax",      "method": "Continuous relaxation (NOTEARS)"},
+    "nas":            {"level": 5, "name": "Architect",   "method": "NAS architecture search"},
+    "e2e":            {"level": 6, "name": "Learn",       "method": "End-to-end joint optimization"},
+}
+
+# DAG priority (higher = preferred when multiple strategies are correct).
+# Higher search levels explored larger spaces → higher priority.
 DAG_PRIORITY = {
-    "search_differentiable": 10, "search_evolutionary": 9,
-    "search_greedy": 8, "search_rl_policy": 8,
+    "search_e2e": 12, "search_nas": 11,
+    "search_differentiable": 10, "search_rl_policy": 9,
+    "search_evolutionary": 8, "search_greedy": 7,
     "cot": 4, "skeleton": 3, "bidirectional": 2, "answer_first": 1,
 }
 

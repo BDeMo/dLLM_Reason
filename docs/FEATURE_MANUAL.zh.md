@@ -171,6 +171,43 @@ class DAGSearcher:
 
 种群初始化默认用 `build_all_templates(seq_len)` 作为 seeds。
 
+### 5.1 搜索层级分类法
+
+所有搜索方法按搜索空间大小组织为递增的层级体系。核心目标是找到离散扩散
+unmasking 的**最优生成顺序**。DAG 提供了一种可解释的结构，每个层级在逐步
+更大的组合空间中搜索：
+
+| 层级 | 名称 | 方法 | 搜索空间 (n=128) | CLI |
+|------|------|------|------------------|-----|
+| L0 | Enumerate | 模板遍历 | 8 个模板 | `--s2_method sweep` |
+| L1 | Perturb | 贪心边搜索 | ~10² | `--s2_search_method greedy` |
+| L2 | Evolve | 种群进化搜索 | ~10³ | `--s2_search_method evolutionary` |
+| L3 | Construct | RL 策略构造 | ~10⁴ | `--s2_search_method rl_policy` |
+| L4 | Relax | 连续松弛 (NOTEARS) | ℝⁿ² | `--s2_search_method differentiable` |
+| L5 | Architect | NAS span 级搜索 | ℝ⁽ⁿ/ˢ⁾² | `--s2_search_method nas` |
+| L6 | Learn | 端到端联合优化 | ℝⁿ² + reg | `--s2_search_method e2e` |
+
+**设计思路：**
+- L0–L2 为**黑盒方法**——不需要梯度，直接评估 DAG 候选。
+- L3 用 **RL**（REINFORCE）学习逐边构造 DAG 的策略。
+- L4–L6 为**梯度方法**——将离散邻接矩阵松弛为连续参数，通过反向传播优化。
+- 层级越高搜索空间越大，但需要更多计算预算。
+- 低层级结果（如 L0 的模板）自动作为高层级的初始种子。
+
+**各层级参数：**
+
+| 层级 | 参数 | 默认值 |
+|------|------|--------|
+| L1 | `--s2_greedy_candidates`, `--s2_greedy_patience` | 10, 5 |
+| L2 | `--s2_evo_pop_size`, `--s2_evo_mutation_rate`, `--s2_evo_crossover_rate` | 20, 0.3, 0.5 |
+| L3 | `--s2_rl_hidden_dim`, `--s2_rl_lr`, `--s2_rl_max_edges` | 128, 1e-4, 50 |
+| L4 | `--s2_diff_lr`, `--s2_diff_rho_init` | 1e-3, 1.0 |
+| L5 | `--s2_nas_mode` (supernet/controller), `--s2_nas_span_size` | supernet, 16 |
+| L6 | `--s2_e2e_lr`, `--s2_e2e_sparsity` | 3e-3, 0.01 |
+
+**推荐策略：** 先用 L0（sweep）建立 baseline，再用 L1–L2 快速改进，最后用
+L4–L6 做深度研究级搜索。
+
 ---
 
 ## 6. Training 层 `dllm_reason.training`

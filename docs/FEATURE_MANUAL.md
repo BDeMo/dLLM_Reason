@@ -171,6 +171,45 @@ class DAGSearcher:
 
 Population initialization defaults to `build_all_templates(seq_len)` as seeds.
 
+### 5.1 Search Level Taxonomy
+
+All search methods are organized into a hierarchy of increasing search space size.
+The core objective is finding the **optimal generation order** for discrete diffusion
+unmasking. DAGs provide an interpretable structure, while each level explores a
+progressively larger portion of the combinatorial space:
+
+| Level | Name | Method | Search Space (n=128) | CLI |
+|-------|------|--------|---------------------|-----|
+| L0 | Enumerate | Template sweep | 8 templates | `--s2_method sweep` |
+| L1 | Perturb | Greedy edge search | ~10² | `--s2_search_method greedy` |
+| L2 | Evolve | Population evolution | ~10³ | `--s2_search_method evolutionary` |
+| L3 | Construct | RL policy construction | ~10⁴ | `--s2_search_method rl_policy` |
+| L4 | Relax | Continuous relaxation (NOTEARS) | ℝⁿ² | `--s2_search_method differentiable` |
+| L5 | Architect | NAS span-level search | ℝ⁽ⁿ/ˢ⁾² | `--s2_search_method nas` |
+| L6 | Learn | End-to-end joint optimization | ℝⁿ² + reg | `--s2_search_method e2e` |
+
+**Design rationale:**
+- L0–L2 are **black-box** — they evaluate DAG candidates without gradients.
+- L3 uses **RL** (REINFORCE) to learn a policy that constructs DAGs edge-by-edge.
+- L4–L6 are **gradient-based** — they relax the discrete adjacency matrix into
+  continuous parameters and optimize via backpropagation.
+- Higher levels explore larger spaces but require more compute budget.
+- Results from lower levels (e.g. templates from L0) seed higher levels automatically.
+
+**Per-level parameters:**
+
+| Level | Parameters | Defaults |
+|-------|-----------|----------|
+| L1 | `--s2_greedy_candidates`, `--s2_greedy_patience` | 10, 5 |
+| L2 | `--s2_evo_pop_size`, `--s2_evo_mutation_rate`, `--s2_evo_crossover_rate` | 20, 0.3, 0.5 |
+| L3 | `--s2_rl_hidden_dim`, `--s2_rl_lr`, `--s2_rl_max_edges` | 128, 1e-4, 50 |
+| L4 | `--s2_diff_lr`, `--s2_diff_rho_init` | 1e-3, 1.0 |
+| L5 | `--s2_nas_mode` (supernet/controller), `--s2_nas_span_size` | supernet, 16 |
+| L6 | `--s2_e2e_lr`, `--s2_e2e_sparsity` | 3e-3, 0.01 |
+
+**Recommended progression:** Start with L0 (sweep) to establish baselines, then
+advance to L1–L2 for quick improvements, and L4–L6 for research-grade exploration.
+
 ---
 
 ## 6. Training Layer — `dllm_reason.training`

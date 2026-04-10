@@ -652,6 +652,59 @@ result = searcher.search(model, eval_fn, seq_len=256, budget=200)
 | E2E DAG Learning | Gradient | Joint DAG + task loss optimization |
 | NAS SuperNet/Controller | Gradient/RL | DARTS or ENAS-style architecture search |
 
+#### Search Level Taxonomy
+
+The 6 search methods are organized into a hierarchy of increasing search space size.
+The core goal is finding the **optimal generation order** — DAGs provide an interpretable
+structure for this, but each level explores a progressively larger space:
+
+| Level | Name | Method | Search Space (n=128) | CLI |
+|-------|------|--------|---------------------|-----|
+| L0 | **Enumerate** | Template sweep | 8 templates | `--s2_method sweep` |
+| L1 | **Perturb** | Greedy edge search | ~10² | `--s2_search_method greedy` |
+| L2 | **Evolve** | Population evolution | ~10³ | `--s2_search_method evolutionary` |
+| L3 | **Construct** | RL policy construction | ~10⁴ | `--s2_search_method rl_policy` |
+| L4 | **Relax** | Continuous relaxation (NOTEARS) | ℝⁿ² | `--s2_search_method differentiable` |
+| L5 | **Architect** | NAS span-level search | ℝ⁽ⁿ/ˢ⁾² | `--s2_search_method nas` |
+| L6 | **Learn** | End-to-end joint optimization | ℝⁿ² + reg | `--s2_search_method e2e` |
+
+**Per-level CLI parameters:**
+
+```bash
+# L0 Enumerate — sweep all 8 DAG templates (no extra params)
+python scripts/run_research_pipeline.py --stages 2 --s2_method sweep
+
+# L1 Perturb — greedy edge flip search
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method greedy --s2_search_budget 100 \
+    --s2_greedy_candidates 10 --s2_greedy_patience 5
+
+# L2 Evolve — evolutionary population search
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method evolutionary --s2_search_budget 200 \
+    --s2_evo_pop_size 20 --s2_evo_mutation_rate 0.3 --s2_evo_crossover_rate 0.5
+
+# L3 Construct — RL policy constructs DAG edge-by-edge
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method rl_policy --s2_search_budget 100 \
+    --s2_rl_hidden_dim 128 --s2_rl_lr 1e-4 --s2_rl_max_edges 50
+
+# L4 Relax — differentiable DAG learning with NOTEARS constraint
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method differentiable --s2_search_budget 100 \
+    --s2_diff_lr 1e-3 --s2_diff_rho_init 1.0
+
+# L5 Architect — NAS-style search (supernet or controller)
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method nas --s2_search_budget 200 \
+    --s2_nas_mode supernet --s2_nas_span_size 16
+
+# L6 Learn — end-to-end joint DAG + task loss
+python scripts/run_research_pipeline.py --stages 2 --s2_method search \
+    --s2_search_method e2e --s2_search_budget 200 \
+    --s2_e2e_lr 3e-3 --s2_e2e_sparsity 0.01
+```
+
 ### DAG Library
 
 Persistent storage + retrieval + feedback for DAG structures.
