@@ -617,7 +617,13 @@ def _patch_dag_noise(model, dag, bias_strength: float = 0.5) -> None:
     def biased_noise(x_0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B, L = x_0.shape
         dev = x_0.device
-        lb = level_bias[:L].to(dev)
+        # Pad or truncate level_bias to match input length L.
+        # Positions beyond DAG range get bias=0 (no DAG influence).
+        if L <= level_bias.shape[0]:
+            lb = level_bias[:L].to(dev)
+        else:
+            lb = torch.zeros(L, device=dev)
+            lb[:level_bias.shape[0]] = level_bias.to(dev)
         base = t[:, None].expand(B, L)
         biased = (1 - bias_strength) * base + bias_strength * (base * (0.5 + lb))
         biased = biased.clamp(0, 1)
