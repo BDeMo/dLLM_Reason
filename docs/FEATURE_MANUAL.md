@@ -587,9 +587,42 @@ See `docs/BUG_AUDIT_V1.4.2.md` (the accompanying audit report) for the CRITICAL 
 
 ## 17. Acknowledgements & References
 
+See [`REFERENCES.md`](../REFERENCES.md) for the full categorized reference list with code entry points.
+
+### Core Models
 - MDLM: https://github.com/kuleshov-group/mdlm
 - SEDD: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion
-- LLaDA: https://github.com/ML-GSAI/LLaDA
-- d1 (diffu-GRPO): https://github.com/dllm-reasoning/d1
-- D3PM: https://arxiv.org/abs/2107.03006
-- NOTEARS: https://arxiv.org/abs/1803.01422
+- LLaDA: https://github.com/ML-GSAI/LLaDA → `models/llada.py`
+- Dream: https://arxiv.org/abs/2501.01399
+- D3PM: https://arxiv.org/abs/2107.03006 → `models/d3pm.py`
+
+### RL Training
+- d1 / diffu-GRPO: https://github.com/dllm-reasoning/d1 → `training/rl_train.py` `DiffuGRPO`
+- DiFFPO: https://arxiv.org/abs/2510.02212 → `training/rl_train.py` `DiFFPO`, `StepBudgetController`
+- UnmaskPolicy (Jazbec et al.): https://arxiv.org/abs/2512.09106 → `training/rl_train.py` `UnmaskingPolicyRL`
+- KL-Regularised Unmasking MDP: https://arxiv.org/abs/2510.05725 → `training/rl_train.py` `UnmaskingPolicyRL` (kl_coeff, kl_ref_type)
+- DCoLT: https://arxiv.org/abs/2505.10446
+- DiffuCoder (coupled-GRPO): https://arxiv.org/abs/2506.20639
+- dUltra: https://arxiv.org/abs/2512.21446
+
+### Progressive Training & Supervised Planner
+- PUMA (Progressive Unmasking Alignment): https://arxiv.org/abs/2602.10314 → `training/progressive_train.py` `ProgressiveTrainer`
+- Where-to-Unmask (Gt-Margin oracle): https://arxiv.org/abs/2602.09501 → `training/supervised_planner.py` `SupervisedPlannerTrainer`, `PlannerScheduler`
+
+### Unmasking Strategies
+- Fast-dLLM: https://arxiv.org/abs/2505.22618 → `scheduler/confidence_scheduler.py`
+- EB-Sampler: https://arxiv.org/abs/2505.24857 → `scheduler/entropy_scheduler.py`
+- MaskGIT: https://arxiv.org/abs/2202.04200 → `scheduler/maskgit_scheduler.py`
+- Block Diffusion: https://arxiv.org/abs/2503.09573 → `scheduler/semi_ar.py`
+
+### Dependency-Aware Decoding (related to our DAG approach)
+- PUNT (conditional independence): https://arxiv.org/abs/2510.21961
+- DEMASK (dependency predictor): https://arxiv.org/abs/2604.02560
+- DDPD (planner-denoiser): https://arxiv.org/abs/2410.06264
+- Self-speculative: https://arxiv.org/abs/2510.03929
+
+### DAG & Search
+- NOTEARS: https://arxiv.org/abs/1803.01422 → `search/differentiable.py`, `search/nas_search.py`, `search/e2e_dag_learner.py`
+- DARTS: https://arxiv.org/abs/1806.09055 → `search/nas_search.py` (supernet mode)
+- ENAS: https://arxiv.org/abs/1802.03268 → `search/nas_search.py` (controller mode)
+- Regularized Evolution: https://arxiv.org/abs/1802.01548 → `search/evolutionary.py`

@@ -69,19 +69,14 @@ class DifferentiableDAG(nn.Module):
     def acyclicity_penalty(self) -> torch.Tensor:
         """NOTEARS acyclicity constraint: h(A) = tr(exp(A * A)) - d.
 
-        h(A) = 0 iff A is a DAG.
+        h(A) = 0 iff A is a DAG.  Uses torch.linalg.matrix_exp for
+        numerical stability (the Taylor series overflows for d >= ~12).
         """
         probs = self.get_edge_probs()
-        # Element-wise square
+        # Element-wise square (Hadamard, not matmul)
         M = probs * probs
-        # Matrix exponential via Taylor series (more stable for autograd)
         d = self.seq_len
-        power = torch.eye(d, device=M.device)
-        result = torch.eye(d, device=M.device)
-        for k in range(1, d + 1):
-            power = torch.mm(power, M) / k
-            result = result + power
-        h = torch.trace(result) - d
+        h = torch.trace(torch.linalg.matrix_exp(M.float())) - d
         return h
 
     def to_dag(self) -> TokenDAG:
@@ -100,9 +95,15 @@ class DifferentiableDAG(nn.Module):
     def _enforce_acyclicity(
         self, adj: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
-        """Remove minimum-weight edges to break cycles."""
+        """Remove minimum-weight edges greedily until the graph is a DAG.
+
+        Strategy: sort edges by weight ascending, remove the lightest ones
+        one by one (without restoring) until acyclicity is achieved.
+        """
         adj = adj.clone()
         edges = adj.nonzero(as_tuple=False)
+        if edges.numel() == 0:
+            return adj
         # Sort by weight ascending (remove lightest first)
         edge_weights = weights[edges[:, 0], edges[:, 1]]
         sorted_idx = edge_weights.argsort()
@@ -112,7 +113,7 @@ class DifferentiableDAG(nn.Module):
             adj[src, dst] = False
             if TokenDAG(adj).is_valid():
                 return adj
-            adj[src, dst] = True  # Restore if didn't help
+            # Don't restore — keep removing until acyclic
 
         return adj
 
@@ -178,7 +179,8 @@ class DifferentiableDAGSearch(DAGSearcher):
             # Hard sample (straight-through)
             hard = (probs > 0.5).float()
             current_adj = (hard - probs).detach() + probs  # (L, L), grad to theta
-            current_dag = TokenDAG(current_adj.detach().bool())
+            # Ensure the hard-sampled DAG is acyclic before evaluation
+            current_dag = diff_dag.to_dag()
 
             # Evaluate fitness of the sampled DAG (non-differentiable)
             fitness = eval_fn(model, current_dag)

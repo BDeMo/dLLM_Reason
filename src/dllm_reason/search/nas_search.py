@@ -78,24 +78,19 @@ class SuperDAG(nn.Module):
             return (torch.sigmoid(self.alpha) > threshold) & self.edge_mask
 
     def acyclicity_penalty(self, tau: float = 1.0) -> torch.Tensor:
-        """NOTEARS penalty on soft adjacency."""
+        """NOTEARS penalty on soft adjacency: tr(exp(A ∘ A)) - d."""
         A = self.get_soft_adjacency(tau)
-        M = A * A
+        M = A * A  # Hadamard square
         d = self.num_spans
-        power = torch.eye(d, device=M.device)
-        result = torch.eye(d, device=M.device)
-        for k in range(1, d + 1):
-            power = torch.mm(power, M) / k
-            result = result + power
-        return torch.trace(result) - d
+        return torch.trace(torch.linalg.matrix_exp(M.float())) - d
 
     def to_span_dag(self, threshold: float = 0.5) -> SpanDAG:
         """Convert to a discrete SpanDAG."""
         adj = self.get_hard_adjacency(threshold)
-        sdag = SpanDAG(num_spans=self.num_spans, span_size=self.span_size)
-        sdag.adjacency = adj
+        seq_len = self.num_spans * self.span_size
+        sdag = SpanDAG(adjacency=adj, span_size=self.span_size, seq_len=seq_len)
         if not sdag.is_valid():
-            # Remove lowest-weight back edges
+            # Remove lowest-weight edges greedily until acyclic
             soft = torch.sigmoid(self.alpha)
             edges = adj.nonzero(as_tuple=False)
             if edges.numel() > 0:
@@ -103,11 +98,11 @@ class SuperDAG(nn.Module):
                 for idx in weights.argsort():
                     src, dst = edges[idx].tolist()
                     adj[src, dst] = False
-                    sdag.adjacency = adj
+                    sdag = SpanDAG(adjacency=adj, span_size=self.span_size,
+                                   seq_len=seq_len)
                     if sdag.is_valid():
                         break
-                    adj[src, dst] = True
-        sdag.adjacency = adj
+                    # Don't restore — keep removing until acyclic
         return sdag
 
     def to_token_dag(self, threshold: float = 0.5) -> TokenDAG:
@@ -232,13 +227,13 @@ class DAGController(nn.Module):
                         adj[i, j] = True
                     idx += 1
 
-            sdag = SpanDAG(num_spans=self.num_spans, span_size=span_size)
-            sdag.adjacency = adj
+            seq_len = self.num_spans * span_size
+            sdag = SpanDAG(adjacency=adj, span_size=span_size, seq_len=seq_len)
             if sdag.is_valid():
                 dags.append(sdag.to_token_dag())
             else:
                 # Fallback: no-edges DAG
-                dags.append(TokenDAG.no_edges(self.num_spans * span_size))
+                dags.append(TokenDAG.no_edges(seq_len))
 
         return dags
 
@@ -431,15 +426,16 @@ class NASDAGSearch(DAGSearcher):
                 if step >= budget:
                     break
 
-            # REINFORCE update
-            rewards_t = torch.tensor(rewards[:len(dags)], device=device)
+            # REINFORCE update — only use the DAGs we actually evaluated
+            n_evaluated = len(rewards)
+            rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)
             advantage = rewards_t - baseline
 
             # Update baseline (EMA)
             baseline = cfg.baseline_ema * baseline + (1 - cfg.baseline_ema) * rewards_t.mean().item()
 
             # Policy gradient loss
-            batch_log_probs = log_probs[:len(dags)]  # (batch, num_decisions)
+            batch_log_probs = log_probs[:n_evaluated]  # (n_evaluated, num_decisions)
             pg_loss = -(batch_log_probs.sum(dim=1) * advantage).mean()
 
             optimizer.zero_grad()

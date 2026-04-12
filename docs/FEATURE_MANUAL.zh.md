@@ -545,9 +545,42 @@ eval/reasoning_eval.py    ──→ scripts/evaluate.py, eval_dags.py
 
 ## 17. 致谢与引用
 
+完整分类引用列表及代码入口见 [`REFERENCES.md`](../REFERENCES.md)。
+
+### 核心模型
 - MDLM: https://github.com/kuleshov-group/mdlm
 - SEDD: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion
-- LLaDA: https://github.com/ML-GSAI/LLaDA
-- d1 (diffu-GRPO): https://github.com/dllm-reasoning/d1
-- D3PM: https://arxiv.org/abs/2107.03006
-- NOTEARS: https://arxiv.org/abs/1803.01422
+- LLaDA: https://github.com/ML-GSAI/LLaDA → `models/llada.py`
+- Dream: https://arxiv.org/abs/2501.01399
+- D3PM: https://arxiv.org/abs/2107.03006 → `models/d3pm.py`
+
+### RL 训练
+- d1 / diffu-GRPO: https://github.com/dllm-reasoning/d1 → `training/rl_train.py` `DiffuGRPO`
+- DiFFPO: https://arxiv.org/abs/2510.02212 → `training/rl_train.py` `DiFFPO`, `StepBudgetController`
+- UnmaskPolicy (Jazbec et al.): https://arxiv.org/abs/2512.09106 → `training/rl_train.py` `UnmaskingPolicyRL`
+- KL 正则化 Unmasking MDP: https://arxiv.org/abs/2510.05725 → `training/rl_train.py` `UnmaskingPolicyRL`（kl_coeff, kl_ref_type）
+- DCoLT: https://arxiv.org/abs/2505.10446
+- DiffuCoder (coupled-GRPO): https://arxiv.org/abs/2506.20639
+- dUltra: https://arxiv.org/abs/2512.21446
+
+### 渐进式训练与监督 Planner
+- PUMA（渐进式 Unmasking 对齐）: https://arxiv.org/abs/2602.10314 → `training/progressive_train.py` `ProgressiveTrainer`
+- Where-to-Unmask（Gt-Margin oracle）: https://arxiv.org/abs/2602.09501 → `training/supervised_planner.py` `SupervisedPlannerTrainer`, `PlannerScheduler`
+
+### Unmasking 策略
+- Fast-dLLM: https://arxiv.org/abs/2505.22618 → `scheduler/confidence_scheduler.py`
+- EB-Sampler: https://arxiv.org/abs/2505.24857 → `scheduler/entropy_scheduler.py`
+- MaskGIT: https://arxiv.org/abs/2202.04200 → `scheduler/maskgit_scheduler.py`
+- Block Diffusion: https://arxiv.org/abs/2503.09573 → `scheduler/semi_ar.py`
+
+### 依赖感知并行解码（与我们的 DAG 方法相关）
+- PUNT（条件独立性检测）: https://arxiv.org/abs/2510.21961
+- DEMASK（依赖预测器）: https://arxiv.org/abs/2604.02560
+- DDPD（planner-denoiser 分离）: https://arxiv.org/abs/2410.06264
+- Self-speculative: https://arxiv.org/abs/2510.03929
+
+### DAG 与搜索
+- NOTEARS: https://arxiv.org/abs/1803.01422 → `search/differentiable.py`, `search/nas_search.py`, `search/e2e_dag_learner.py`
+- DARTS: https://arxiv.org/abs/1806.09055 → `search/nas_search.py`（supernet 模式）
+- ENAS: https://arxiv.org/abs/1802.03268 → `search/nas_search.py`（controller 模式）
+- Regularized Evolution: https://arxiv.org/abs/1802.01548 → `search/evolutionary.py`
