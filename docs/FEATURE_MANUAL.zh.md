@@ -171,6 +171,43 @@ class DAGSearcher:
 
 种群初始化默认用 `build_all_templates(seq_len)` 作为 seeds。
 
+### 5.1 搜索层级分类法
+
+所有搜索方法按搜索空间大小组织为递增的层级体系。核心目标是找到离散扩散
+unmasking 的**最优生成顺序**。DAG 提供了一种可解释的结构，每个层级在逐步
+更大的组合空间中搜索：
+
+| 层级 | 名称 | 方法 | 搜索空间 (n=128) | CLI |
+|------|------|------|------------------|-----|
+| L0 | Enumerate | 模板遍历 | 8 个模板 | `--s2_method sweep` |
+| L1 | Perturb | 贪心边搜索 | ~10² | `--s2_search_method greedy` |
+| L2 | Evolve | 种群进化搜索 | ~10³ | `--s2_search_method evolutionary` |
+| L3 | Construct | RL 策略构造 | ~10⁴ | `--s2_search_method rl_policy` |
+| L4 | Relax | 连续松弛 (NOTEARS) | ℝⁿ² | `--s2_search_method differentiable` |
+| L5 | Architect | NAS span 级搜索 | ℝ⁽ⁿ/ˢ⁾² | `--s2_search_method nas` |
+| L6 | Learn | 端到端联合优化 | ℝⁿ² + reg | `--s2_search_method e2e` |
+
+**设计思路：**
+- L0–L2 为**黑盒方法**——不需要梯度，直接评估 DAG 候选。
+- L3 用 **RL**（REINFORCE）学习逐边构造 DAG 的策略。
+- L4–L6 为**梯度方法**——将离散邻接矩阵松弛为连续参数，通过反向传播优化。
+- 层级越高搜索空间越大，但需要更多计算预算。
+- 低层级结果（如 L0 的模板）自动作为高层级的初始种子。
+
+**各层级参数：**
+
+| 层级 | 参数 | 默认值 |
+|------|------|--------|
+| L1 | `--s2_greedy_candidates`, `--s2_greedy_patience` | 10, 5 |
+| L2 | `--s2_evo_pop_size`, `--s2_evo_mutation_rate`, `--s2_evo_crossover_rate` | 20, 0.3, 0.5 |
+| L3 | `--s2_rl_hidden_dim`, `--s2_rl_lr`, `--s2_rl_max_edges` | 128, 1e-4, 50 |
+| L4 | `--s2_diff_lr`, `--s2_diff_rho_init` | 1e-3, 1.0 |
+| L5 | `--s2_nas_mode` (supernet/controller), `--s2_nas_span_size` | supernet, 16 |
+| L6 | `--s2_e2e_lr`, `--s2_e2e_sparsity` | 3e-3, 0.01 |
+
+**推荐策略：** 先用 L0（sweep）建立 baseline，再用 L1–L2 快速改进，最后用
+L4–L6 做深度研究级搜索。
+
 ---
 
 ## 6. Training 层 `dllm_reason.training`
@@ -508,9 +545,42 @@ eval/reasoning_eval.py    ──→ scripts/evaluate.py, eval_dags.py
 
 ## 17. 致谢与引用
 
+完整分类引用列表及代码入口见 [`REFERENCES.md`](../REFERENCES.md)。
+
+### 核心模型
 - MDLM: https://github.com/kuleshov-group/mdlm
 - SEDD: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion
-- LLaDA: https://github.com/ML-GSAI/LLaDA
-- d1 (diffu-GRPO): https://github.com/dllm-reasoning/d1
-- D3PM: https://arxiv.org/abs/2107.03006
-- NOTEARS: https://arxiv.org/abs/1803.01422
+- LLaDA: https://github.com/ML-GSAI/LLaDA → `models/llada.py`
+- Dream: https://arxiv.org/abs/2501.01399
+- D3PM: https://arxiv.org/abs/2107.03006 → `models/d3pm.py`
+
+### RL 训练
+- d1 / diffu-GRPO: https://github.com/dllm-reasoning/d1 → `training/rl_train.py` `DiffuGRPO`
+- DiFFPO: https://arxiv.org/abs/2510.02212 → `training/rl_train.py` `DiFFPO`, `StepBudgetController`
+- UnmaskPolicy (Jazbec et al.): https://arxiv.org/abs/2512.09106 → `training/rl_train.py` `UnmaskingPolicyRL`
+- KL 正则化 Unmasking MDP: https://arxiv.org/abs/2510.05725 → `training/rl_train.py` `UnmaskingPolicyRL`（kl_coeff, kl_ref_type）
+- DCoLT: https://arxiv.org/abs/2505.10446
+- DiffuCoder (coupled-GRPO): https://arxiv.org/abs/2506.20639
+- dUltra: https://arxiv.org/abs/2512.21446
+
+### 渐进式训练与监督 Planner
+- PUMA（渐进式 Unmasking 对齐）: https://arxiv.org/abs/2602.10314 → `training/progressive_train.py` `ProgressiveTrainer`
+- Where-to-Unmask（Gt-Margin oracle）: https://arxiv.org/abs/2602.09501 → `training/supervised_planner.py` `SupervisedPlannerTrainer`, `PlannerScheduler`
+
+### Unmasking 策略
+- Fast-dLLM: https://arxiv.org/abs/2505.22618 → `scheduler/confidence_scheduler.py`
+- EB-Sampler: https://arxiv.org/abs/2505.24857 → `scheduler/entropy_scheduler.py`
+- MaskGIT: https://arxiv.org/abs/2202.04200 → `scheduler/maskgit_scheduler.py`
+- Block Diffusion: https://arxiv.org/abs/2503.09573 → `scheduler/semi_ar.py`
+
+### 依赖感知并行解码（与我们的 DAG 方法相关）
+- PUNT（条件独立性检测）: https://arxiv.org/abs/2510.21961
+- DEMASK（依赖预测器）: https://arxiv.org/abs/2604.02560
+- DDPD（planner-denoiser 分离）: https://arxiv.org/abs/2410.06264
+- Self-speculative: https://arxiv.org/abs/2510.03929
+
+### DAG 与搜索
+- NOTEARS: https://arxiv.org/abs/1803.01422 → `search/differentiable.py`, `search/nas_search.py`, `search/e2e_dag_learner.py`
+- DARTS: https://arxiv.org/abs/1806.09055 → `search/nas_search.py`（supernet 模式）
+- ENAS: https://arxiv.org/abs/1802.03268 → `search/nas_search.py`（controller 模式）
+- Regularized Evolution: https://arxiv.org/abs/1802.01548 → `search/evolutionary.py`

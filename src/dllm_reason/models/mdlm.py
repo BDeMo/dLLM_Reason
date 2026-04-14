@@ -75,7 +75,8 @@ class MDLM(DiffusionLM):
             (batch,) sigma(t) in [0, 1]
         """
         if self.noise_schedule == "geometric":
-            return 1.0 - (1.0 - self.sigma_min) ** t
+            # sigma(0) = 0 (clean), sigma(1) = 1 - sigma_min ≈ 1 (fully masked)
+            return 1.0 - self.sigma_min ** t
         elif self.noise_schedule == "linear":
             return t
         elif self.noise_schedule == "cosine":
@@ -89,8 +90,9 @@ class MDLM(DiffusionLM):
         Needed for continuous-time ELBO computation.
         """
         if self.noise_schedule == "geometric":
-            return -(1.0 - self.sigma_min) ** t * torch.log(
-                torch.tensor(1.0 - self.sigma_min, device=t.device)
+            # d/dt [1 - sigma_min^t] = -sigma_min^t * log(sigma_min)
+            return -(self.sigma_min ** t) * torch.log(
+                torch.tensor(self.sigma_min, device=t.device)
             )
         elif self.noise_schedule == "linear":
             return torch.ones_like(t)

@@ -538,6 +538,7 @@ class UnmaskingPolicyConfig:
     """Configuration for the RL-trained unmasking policy.
 
     Reference: Jazbec et al. 2025 — https://arxiv.org/abs/2512.09106
+    KL regularisation: arXiv:2510.05725
     """
     # Optimisation
     lr: float = 3e-4
@@ -554,6 +555,22 @@ class UnmaskingPolicyConfig:
     policy_d_model: int = 64       # transformer d_model
     policy_n_heads: int = 4        # attention heads
     policy_dropout: float = 0.0
+
+    # KL regularisation (arXiv:2510.05725)
+    kl_coeff: float = 0.0
+    """KL penalty coefficient β.  When > 0, adds  β · KL(π‖π_ref) to the
+    REINFORCE loss.  Set to 0 to disable (vanilla REINFORCE).
+    Recommended range: 0.001 – 0.1."""
+
+    kl_ref_type: str = "uniform"
+    """Reference policy type for KL regularisation.
+    'uniform'  — each masked position has equal probability of being unmasked.
+    'dag'      — probability proportional to DAG readiness (requires dag arg).
+    'pretrained' — a pre-trained planner checkpoint (requires ref_policy_path).
+    """
+
+    ref_policy_path: str | None = None
+    """Path to a pre-trained planner checkpoint (used when kl_ref_type='pretrained')."""
 
 
 class UnmaskingPolicyNet(torch.nn.Module):
@@ -644,11 +661,13 @@ class UnmaskingPolicyRL:
         reward_fn: Callable[[torch.Tensor, dict], float],
         train_loader: DataLoader,
         config: UnmaskingPolicyConfig | None = None,
+        dag=None,
     ):
         self.model = model
         self.reward_fn = reward_fn
         self.train_loader = train_loader
         self.config = config or UnmaskingPolicyConfig()
+        self.dag = dag  # Optional TokenDAG for DAG-based reference policy
 
         cfg = self.config
         device = model.device
@@ -666,9 +685,29 @@ class UnmaskingPolicyRL:
             p.requires_grad = False
         self.model.eval()
 
+        # ── Reference policy for KL regularisation ───────────────────
+        self._ref_policy: UnmaskingPolicyNet | None = None
+        if cfg.kl_coeff > 0 and cfg.kl_ref_type == "pretrained":
+            if cfg.ref_policy_path is None:
+                raise ValueError(
+                    "kl_ref_type='pretrained' requires ref_policy_path"
+                )
+            self._ref_policy = UnmaskingPolicyNet(
+                d_model=cfg.policy_d_model,
+                n_heads=cfg.policy_n_heads,
+                dropout=0.0,
+            ).to(device)
+            state = torch.load(cfg.ref_policy_path, map_location=device)
+            self._ref_policy.load_state_dict(state)
+            for p in self._ref_policy.parameters():
+                p.requires_grad = False
+            self._ref_policy.eval()
+            logger.info(f"Loaded reference policy from {cfg.ref_policy_path}")
+
         n_policy = sum(p.numel() for p in self.policy.parameters())
         logger.info(
-            f"UnmaskingPolicyRL ready — policy params={n_policy:,}, LM frozen."
+            f"UnmaskingPolicyRL ready — policy params={n_policy:,}, "
+            f"LM frozen, kl_coeff={cfg.kl_coeff}, kl_ref={cfg.kl_ref_type}."
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -681,12 +720,54 @@ class UnmaskingPolicyRL:
         out = self.model.forward(x, t)
         return F.softmax(out.logits, dim=-1).max(dim=-1).values  # (B, L)
 
+    def _ref_log_prob(
+        self,
+        conf: torch.Tensor,
+        action: torch.Tensor,
+        is_masked: torch.Tensor,
+    ) -> torch.Tensor:
+        """Log probability of ``action`` under the reference policy.
+
+        Args:
+            conf:      (B, L) confidence scores (input to policy).
+            action:    (B, L) binary unmasking decisions.
+            is_masked: (B, L) bool, positions eligible for unmasking.
+
+        Returns:
+            (B,) summed per-step log prob under π_ref.
+        """
+        cfg = self.config
+        B, L = conf.shape
+        device = conf.device
+
+        if cfg.kl_ref_type == "uniform":
+            # Uniform: each masked position unmasked with p=0.5
+            ref_logits = torch.zeros(B, L, device=device)
+
+        elif cfg.kl_ref_type == "dag" and self.dag is not None:
+            # DAG-based: higher probability for ready positions
+            is_unmasked = ~is_masked
+            ready = self.dag.ready_positions(is_unmasked)  # (B, L) bool
+            ref_logits = torch.where(ready & is_masked, 1.0, -1.0)
+
+        elif cfg.kl_ref_type == "pretrained" and self._ref_policy is not None:
+            with torch.no_grad():
+                ref_logits = self._ref_policy(conf * is_masked.float())
+        else:
+            # Fallback to uniform
+            ref_logits = torch.zeros(B, L, device=device)
+
+        ref_logits = ref_logits.masked_fill(~is_masked, -1e9)
+        ref_dist = torch.distributions.Bernoulli(logits=ref_logits)
+        ref_lp = (ref_dist.log_prob(action) * is_masked.float()).sum(-1)
+        return ref_lp
+
     def _policy_rollout(
         self,
         prompt_ids: torch.Tensor,
         prompt_mask: torch.Tensor,
         gen_length: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run one policy-controlled diffusion rollout.
 
         At each of ``num_steps`` steps:
@@ -697,8 +778,10 @@ class UnmaskingPolicyRL:
           4. Accumulate step log-probabilities for REINFORCE.
 
         Returns:
-            sequences:    (B, L) final token ids after full rollout.
-            log_prob_sum: (B,)  summed step log-probs for REINFORCE.
+            sequences:        (B, L) final token ids after full rollout.
+            log_prob_sum:     (B,) summed step log-probs for REINFORCE.
+            ref_log_prob_sum: (B,) summed step log-probs under π_ref
+                              (zero when kl_coeff=0).
         """
         cfg = self.config
         device = prompt_ids.device
@@ -713,6 +796,7 @@ class UnmaskingPolicyRL:
         ts = torch.linspace(1.0, 0.0, cfg.num_steps + 1, device=device)[:-1]
 
         log_prob_sum = torch.zeros(B, device=device)
+        ref_log_prob_sum = torch.zeros(B, device=device)
         self.policy.train()
 
         for step_i in range(cfg.num_steps):
@@ -734,6 +818,11 @@ class UnmaskingPolicyRL:
             step_lp = (dist.log_prob(action) * is_masked.float()).sum(-1)  # (B,)
             log_prob_sum = log_prob_sum + step_lp
 
+            # 3b. Reference policy log prob (for KL penalty)
+            if cfg.kl_coeff > 0:
+                ref_lp = self._ref_log_prob(conf, action, is_masked)
+                ref_log_prob_sum = ref_log_prob_sum + ref_lp
+
             # 4. Decode selected positions with LM argmax
             unmask_pos = action.bool() & is_masked
             if unmask_pos.any():
@@ -750,7 +839,7 @@ class UnmaskingPolicyRL:
                 ).logits.argmax(-1)
                 x = torch.where(still_masked, pred_ids, x)
 
-        return x, log_prob_sum
+        return x, log_prob_sum, ref_log_prob_sum
 
     # ── Training loop ─────────────────────────────────────────────────────
 
@@ -778,9 +867,10 @@ class UnmaskingPolicyRL:
             # ── REINFORCE: collect group_size rollouts ────────────────
             all_rewards:   list[torch.Tensor] = []
             all_log_probs: list[torch.Tensor] = []
+            all_ref_lps:   list[torch.Tensor] = []
 
             for _ in range(cfg.group_size):
-                seqs, lp = self._policy_rollout(
+                seqs, lp, ref_lp = self._policy_rollout(
                     prompt_ids, prompt_mask, gen_length
                 )
                 rewards = torch.tensor(
@@ -789,9 +879,11 @@ class UnmaskingPolicyRL:
                 )
                 all_rewards.append(rewards)
                 all_log_probs.append(lp)
+                all_ref_lps.append(ref_lp)
 
             rewards_t   = torch.stack(all_rewards)    # (K, B)
             log_probs_t = torch.stack(all_log_probs)  # (K, B)
+            ref_lps_t   = torch.stack(all_ref_lps)    # (K, B)
 
             # Group-mean baseline (control variate)
             baseline   = rewards_t.mean(0, keepdim=True)   # (1, B)
@@ -800,8 +892,16 @@ class UnmaskingPolicyRL:
             # REINFORCE loss
             policy_loss = -(advantages.detach() * log_probs_t).mean()
 
+            # KL regularisation: β · KL(π‖π_ref) ≈ β · E[log π - log π_ref]
+            kl_loss = torch.tensor(0.0, device=device)
+            if cfg.kl_coeff > 0:
+                kl = log_probs_t - ref_lps_t  # (K, B)
+                kl_loss = cfg.kl_coeff * kl.mean()
+
+            total_loss = policy_loss + kl_loss
+
             self.optimizer.zero_grad()
-            policy_loss.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), cfg.max_grad_norm
             )
@@ -809,10 +909,12 @@ class UnmaskingPolicyRL:
 
             if (iteration + 1) % cfg.log_every == 0:
                 mean_r = rewards_t.mean().item()
+                kl_val = kl_loss.item() if cfg.kl_coeff > 0 else 0.0
                 logger.info(
                     f"Iter {iteration+1}/{cfg.num_iterations}  "
                     f"reward={mean_r:.4f}  "
-                    f"policy_loss={policy_loss.item():.4f}"
+                    f"policy_loss={policy_loss.item():.4f}  "
+                    f"kl_loss={kl_val:.4f}"
                 )
 
     def save_policy(self, path: str) -> None:

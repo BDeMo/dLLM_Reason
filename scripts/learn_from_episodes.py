@@ -604,9 +604,19 @@ def _build_aggregate_dag(
 
 
 def _patch_dag_noise(model, dag, bias_strength: float = 0.5) -> None:
-    """Monkey-patch model.noise_input to use DAG-biased masking."""
+    """Monkey-patch model.noise_input to use DAG-biased masking.
+
+    The DAG defines topological levels over generation positions.
+    Earlier levels (roots) get *lower* mask probability → unmasked first.
+    Later levels (dependents) get *higher* mask probability → stay masked longer.
+
+    level_bias is a 1-D tensor of shape (dag.seq_len,) with values in [0, 1].
+    When the actual input length L differs from dag.seq_len, the bias is
+    right-padded with zeros (extra positions get no DAG influence).
+    """
     levels = dag.topological_levels()
-    level_bias = torch.zeros(dag.seq_len)
+    n = dag.seq_len
+    level_bias = torch.zeros(n)
     for level_idx, positions in enumerate(levels):
         bias_val = level_idx / max(len(levels) - 1, 1)
         for pos in positions:
@@ -617,11 +627,11 @@ def _patch_dag_noise(model, dag, bias_strength: float = 0.5) -> None:
     def biased_noise(x_0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B, L = x_0.shape
         dev = x_0.device
-        lb = level_bias[:L].to(dev)
+        # Align level_bias to input length: truncate or zero-pad
+        lb = torch.nn.functional.pad(level_bias, (0, max(0, L - n)))[:L].to(dev)
         base = t[:, None].expand(B, L)
         biased = (1 - bias_strength) * base + bias_strength * (base * (0.5 + lb))
-        biased = biased.clamp(0, 1)
-        mask = torch.rand(B, L, device=dev) < biased
+        mask = torch.rand(B, L, device=dev) < biased.clamp(0, 1)
         return torch.where(mask, model.mask_token_id, x_0)
 
     model.noise_input = biased_noise

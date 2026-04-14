@@ -171,6 +171,45 @@ class DAGSearcher:
 
 Population initialization defaults to `build_all_templates(seq_len)` as seeds.
 
+### 5.1 Search Level Taxonomy
+
+All search methods are organized into a hierarchy of increasing search space size.
+The core objective is finding the **optimal generation order** for discrete diffusion
+unmasking. DAGs provide an interpretable structure, while each level explores a
+progressively larger portion of the combinatorial space:
+
+| Level | Name | Method | Search Space (n=128) | CLI |
+|-------|------|--------|---------------------|-----|
+| L0 | Enumerate | Template sweep | 8 templates | `--s2_method sweep` |
+| L1 | Perturb | Greedy edge search | ~10² | `--s2_search_method greedy` |
+| L2 | Evolve | Population evolution | ~10³ | `--s2_search_method evolutionary` |
+| L3 | Construct | RL policy construction | ~10⁴ | `--s2_search_method rl_policy` |
+| L4 | Relax | Continuous relaxation (NOTEARS) | ℝⁿ² | `--s2_search_method differentiable` |
+| L5 | Architect | NAS span-level search | ℝ⁽ⁿ/ˢ⁾² | `--s2_search_method nas` |
+| L6 | Learn | End-to-end joint optimization | ℝⁿ² + reg | `--s2_search_method e2e` |
+
+**Design rationale:**
+- L0–L2 are **black-box** — they evaluate DAG candidates without gradients.
+- L3 uses **RL** (REINFORCE) to learn a policy that constructs DAGs edge-by-edge.
+- L4–L6 are **gradient-based** — they relax the discrete adjacency matrix into
+  continuous parameters and optimize via backpropagation.
+- Higher levels explore larger spaces but require more compute budget.
+- Results from lower levels (e.g. templates from L0) seed higher levels automatically.
+
+**Per-level parameters:**
+
+| Level | Parameters | Defaults |
+|-------|-----------|----------|
+| L1 | `--s2_greedy_candidates`, `--s2_greedy_patience` | 10, 5 |
+| L2 | `--s2_evo_pop_size`, `--s2_evo_mutation_rate`, `--s2_evo_crossover_rate` | 20, 0.3, 0.5 |
+| L3 | `--s2_rl_hidden_dim`, `--s2_rl_lr`, `--s2_rl_max_edges` | 128, 1e-4, 50 |
+| L4 | `--s2_diff_lr`, `--s2_diff_rho_init` | 1e-3, 1.0 |
+| L5 | `--s2_nas_mode` (supernet/controller), `--s2_nas_span_size` | supernet, 16 |
+| L6 | `--s2_e2e_lr`, `--s2_e2e_sparsity` | 3e-3, 0.01 |
+
+**Recommended progression:** Start with L0 (sweep) to establish baselines, then
+advance to L1–L2 for quick improvements, and L4–L6 for research-grade exploration.
+
 ---
 
 ## 6. Training Layer — `dllm_reason.training`
@@ -548,9 +587,42 @@ See `docs/BUG_AUDIT_V1.4.2.md` (the accompanying audit report) for the CRITICAL 
 
 ## 17. Acknowledgements & References
 
+See [`REFERENCES.md`](../REFERENCES.md) for the full categorized reference list with code entry points.
+
+### Core Models
 - MDLM: https://github.com/kuleshov-group/mdlm
 - SEDD: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion
-- LLaDA: https://github.com/ML-GSAI/LLaDA
-- d1 (diffu-GRPO): https://github.com/dllm-reasoning/d1
-- D3PM: https://arxiv.org/abs/2107.03006
-- NOTEARS: https://arxiv.org/abs/1803.01422
+- LLaDA: https://github.com/ML-GSAI/LLaDA → `models/llada.py`
+- Dream: https://arxiv.org/abs/2501.01399
+- D3PM: https://arxiv.org/abs/2107.03006 → `models/d3pm.py`
+
+### RL Training
+- d1 / diffu-GRPO: https://github.com/dllm-reasoning/d1 → `training/rl_train.py` `DiffuGRPO`
+- DiFFPO: https://arxiv.org/abs/2510.02212 → `training/rl_train.py` `DiFFPO`, `StepBudgetController`
+- UnmaskPolicy (Jazbec et al.): https://arxiv.org/abs/2512.09106 → `training/rl_train.py` `UnmaskingPolicyRL`
+- KL-Regularised Unmasking MDP: https://arxiv.org/abs/2510.05725 → `training/rl_train.py` `UnmaskingPolicyRL` (kl_coeff, kl_ref_type)
+- DCoLT: https://arxiv.org/abs/2505.10446
+- DiffuCoder (coupled-GRPO): https://arxiv.org/abs/2506.20639
+- dUltra: https://arxiv.org/abs/2512.21446
+
+### Progressive Training & Supervised Planner
+- PUMA (Progressive Unmasking Alignment): https://arxiv.org/abs/2602.10314 → `training/progressive_train.py` `ProgressiveTrainer`
+- Where-to-Unmask (Gt-Margin oracle): https://arxiv.org/abs/2602.09501 → `training/supervised_planner.py` `SupervisedPlannerTrainer`, `PlannerScheduler`
+
+### Unmasking Strategies
+- Fast-dLLM: https://arxiv.org/abs/2505.22618 → `scheduler/confidence_scheduler.py`
+- EB-Sampler: https://arxiv.org/abs/2505.24857 → `scheduler/entropy_scheduler.py`
+- MaskGIT: https://arxiv.org/abs/2202.04200 → `scheduler/maskgit_scheduler.py`
+- Block Diffusion: https://arxiv.org/abs/2503.09573 → `scheduler/semi_ar.py`
+
+### Dependency-Aware Decoding (related to our DAG approach)
+- PUNT (conditional independence): https://arxiv.org/abs/2510.21961
+- DEMASK (dependency predictor): https://arxiv.org/abs/2604.02560
+- DDPD (planner-denoiser): https://arxiv.org/abs/2410.06264
+- Self-speculative: https://arxiv.org/abs/2510.03929
+
+### DAG & Search
+- NOTEARS: https://arxiv.org/abs/1803.01422 → `search/differentiable.py`, `search/nas_search.py`, `search/e2e_dag_learner.py`
+- DARTS: https://arxiv.org/abs/1806.09055 → `search/nas_search.py` (supernet mode)
+- ENAS: https://arxiv.org/abs/1802.03268 → `search/nas_search.py` (controller mode)
+- Regularized Evolution: https://arxiv.org/abs/1802.01548 → `search/evolutionary.py`
