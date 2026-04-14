@@ -114,7 +114,7 @@ class TestSampling:
         scheduler = RandomScheduler()
         sampler = DiffusionSampler(
             mdlm, scheduler,
-            SamplingConfig(num_steps=4, show_progress=False),
+            SamplingConfig(num_steps=4, block_length=SEQ_LEN, show_progress=False),
         )
         result = sampler.sample(prompt_ids=prompt_ids, prompt_mask=prompt_mask, gen_length=SEQ_LEN)
         assert result.sequences.shape == (B, SEQ_LEN)
@@ -133,7 +133,7 @@ class TestSampling:
         scheduler = DAGScheduler(dag, sub_strategy="all_ready")
         sampler = DiffusionSampler(
             mdlm, scheduler,
-            SamplingConfig(num_steps=SEQ_LEN, show_progress=False),
+            SamplingConfig(num_steps=SEQ_LEN, block_length=SEQ_LEN, show_progress=False),
         )
         result = sampler.sample(prompt_ids=prompt_ids, prompt_mask=prompt_mask, gen_length=SEQ_LEN)
         assert result.sequences.shape == (1, SEQ_LEN)
