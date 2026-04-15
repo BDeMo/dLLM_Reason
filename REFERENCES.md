@@ -73,6 +73,19 @@ PUNT and DEMASK model token dependencies to enable safe parallel unmasking — c
 
 ---
 
+## Inference-Time Constraint Injection
+
+| Paper | Where used |
+|---|---|
+| **CDD (Constrained Discrete Diffusion)** — Cardei, Christopher, Hartvigsen, Kailkhura, Fioretto. NeurIPS 2025. [arXiv:2503.09790](https://arxiv.org/abs/2503.09790) | — (planned: `inference/constrained_sampler.py` — training-free constraint projection hook in the diffusion sampling loop) |
+
+CDD embeds differentiable constraint optimization **inside** the discrete diffusion sampling procedure to enforce logic rules / safety requirements without retraining. Relation to this project:
+- **Order Discovery (子问题 1)** — CDD 的 constraint projection 是一种 state-level、内容自适应的 π 构造方式，严格超出 DAG（静态位置偏序）的表达力，正好补足我们审查中识别的"DAG 不能表示 content-adaptive policy"缺口
+- **Complementary to TokenDAG** — DAG 给出硬的位置级偏序约束，CDD 给出软的 token-value 级约束；两者可以叠加（DAG 剪枝候选位置 × CDD 过滤候选 token）
+- **可落地方向**：加入 `inference/constrained_sampler.py`，在现有 `DiffusionSampler.sample()` 的 logits → argmax 之间插入 constraint 投影步（例如正则表达式、词表黑名单、逻辑谓词），无需训练
+
+---
+
 ## DAG Search & Structure Learning
 
 | Paper | Where used |
