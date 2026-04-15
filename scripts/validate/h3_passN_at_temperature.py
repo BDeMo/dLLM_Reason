@@ -33,12 +33,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 ROOT = Path(__file__).resolve().parents[2]
 SCOPE = ROOT / "runs" / "validation" / "scope_fail_prompts.json"
-DB = ROOT / "runs" / "research_20260411_030422" / "stage2_discovery" / "episodes.db"
 OUT_BASE = ROOT / "runs" / "validation"
 
 
-def load_init_ok(k: int):
-    conn = sqlite3.connect(DB)
+def find_latest_db() -> Path | None:
+    cands = sorted((ROOT / "runs").glob("research_*/stage2_discovery/episodes.db"))
+    return cands[-1] if cands else None
+
+
+def load_init_ok(k: int, db_path: Path):
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT prompt, ground_truth FROM episodes WHERE correct=1 LIMIT ?", (k,))
     rows = cur.fetchall()
@@ -130,18 +134,25 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
+    ap.add_argument("--db", type=str, default=None,
+                    help="episodes.db 路径，留空则自动取 runs/research_*/stage2_discovery/episodes.db 最新一个")
     add_common_args(ap)
     args = ap.parse_args()
 
     assert SCOPE.exists(), f"先跑 h0_forensics.py 生成 {SCOPE}"
     fail_prompts = json.loads(SCOPE.read_text(encoding="utf-8"))[: args.n_fail]
 
-    # 只有真跑时才读 db（dry_run 也允许没有 db）
-    if args.dry_run and not DB.exists():
+    db_path = Path(args.db) if args.db else find_latest_db()
+    if args.dry_run and (db_path is None or not db_path.exists()):
         ok_prompts = [{"prompt": "(dry_run placeholder)", "ground_truth": "0"}] * args.n_ok
+        print(f"[H3] DRY RUN: 无 db，使用 placeholder ok prompts")
     else:
-        assert DB.exists(), f"DB not found: {DB}"
-        ok_prompts = load_init_ok(args.n_ok)
+        assert db_path is not None and db_path.exists(), (
+            f"DB not found: {db_path}\n"
+            f"显式传 --db 或确保 runs/research_*/stage2_discovery/episodes.db 存在"
+        )
+        print(f"[H3] using DB: {db_path.relative_to(ROOT) if db_path.is_relative_to(ROOT) else db_path}")
+        ok_prompts = load_init_ok(args.n_ok, db_path)
     print(f"[H3] fail={len(fail_prompts)}  ok={len(ok_prompts)}  "
           f"temps={args.temps}  N={args.n_samples}")
 

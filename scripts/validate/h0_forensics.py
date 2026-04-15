@@ -20,10 +20,15 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
-DB = ROOT / "runs" / "research_20260411_030422" / "stage2_discovery" / "episodes.db"
 OUT_DIR = ROOT / "runs" / "validation"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT = OUT_DIR / "scope_fail_prompts.json"
+
+
+def find_latest_db() -> Path | None:
+    """Find newest runs/research_*/stage2_discovery/episodes.db."""
+    cands = sorted((ROOT / "runs").glob("research_*/stage2_discovery/episodes.db"))
+    return cands[-1] if cands else None
 
 
 def extract_numbers(s: str) -> list[float]:
@@ -60,8 +65,19 @@ def classify(gt: str, output: str) -> str:
 
 
 def main():
-    assert DB.exists(), f"DB not found: {DB}"
-    conn = sqlite3.connect(DB)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", type=str, default=None,
+                    help="episodes.db 路径，留空则自动取 runs/research_*/stage2_discovery/episodes.db 最新一个")
+    args = ap.parse_args()
+
+    db_path = Path(args.db) if args.db else find_latest_db()
+    assert db_path is not None and db_path.exists(), (
+        f"DB not found: {db_path}\n"
+        f"显式传 --db 或确保 runs/research_*/stage2_discovery/episodes.db 存在"
+    )
+    print(f"[H0] using DB: {db_path.relative_to(ROOT) if db_path.is_relative_to(ROOT) else db_path}")
+    conn = sqlite3.connect(db_path)
     df = pd.read_sql_query(
         "SELECT episode_id, prompt, ground_truth, output, correct, "
         "dag_seq_len, num_steps, block_length FROM episodes WHERE correct=0",
