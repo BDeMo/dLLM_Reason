@@ -1,71 +1,73 @@
-# Finding: Static DAG Search 在 gsm8k 上挽救率为 0
+# Finding: Static DAG Search Yields Zero Rescue on gsm8k
 
-**日期**：2026-04-15
-**包版本**：`dllm-reason v1.5.3`（`pyproject.toml`）
-**状态**：Archived — 作为 Phase 1 pivot 的核心依据
+> Language: English  |  中文: [finding_dag_search_zero_rescue.zh.md](finding_dag_search_zero_rescue.zh.md)
+
+**Date**: 2026-04-15
+**Package version**: `dllm-reason v1.5.3` (`pyproject.toml`)
+**Status**: Archived — core evidence for the Phase 1 pivot
 
 ---
 
-## 1. 实验环境（完全复现所需）
+## 1. Experimental setup (full reproduction)
 
-### 1.1 模型 & 推理配置（`configs/eval_default.yaml`）
+### 1.1 Model & inference config (`configs/eval_default.yaml`)
 
-| 项 | 值 |
+| Field | Value |
 |---|---|
 | `model_id` | `checkpoints/llada-instruct` |
 | `torch_dtype` | `bfloat16` |
 | `num_steps` | 128 |
-| `block_length` | 32（sequence 分 4 block，每 block 32 tokens） |
-| `temperature` | **0.0**（greedy argmax） |
+| `block_length` | 32 (sequence split into 4 blocks × 32 tokens) |
+| `temperature` | **0.0** (greedy argmax) |
 | `cfg_scale` | 0.0 |
-| `remasking` | `low_confidence`（原生 llada 采样，无额外纠错） |
+| `remasking` | `low_confidence` (native LLaDA sampling, no extra correction) |
 | `max_new_tokens` | 128 |
 
-**序列布局**：`L = 128`（prompt 32 + gen 64 + padding 32，由 best_dag_edges/depth 推算确认）
+**Sequence layout**: `L = 128` (prompt 32 + gen 64 + padding 32, inferred from best_dag_edges/depth).
 
-### 1.2 搜索配置（`configs/search/greedy.yaml`）
+### 1.2 Search config (`configs/search/greedy.yaml`)
 
-| 项 | 配置值 | 实际运行值 |
+| Field | Config | Actual run |
 |---|---|---|
 | `method` | greedy | greedy ✅ |
-| `budget` | 100 | **30**（CLI override） |
+| `budget` | 100 | **30** (CLI override) |
 | `num_candidates` | 10 | 10 |
 | `patience` | 5 | 5 |
-| `initial_dag` | `cot`（CoT template warm-start） | — |
+| `initial_dag` | `cot` (CoT template warm-start) | — |
 | `fitness` | accuracy | accuracy |
 | `fitness_samples` | 50 | — |
 
-### 1.3 搜索算法（`src/dllm_reason/search/greedy.py` — `GreedyEdgeSearch`）
+### 1.3 Search algorithm (`src/dllm_reason/search/greedy.py` — `GreedyEdgeSearch`)
 
-**流程**：
-1. **Template warm-start**：跑 `init_templates` 里所有模板（观察 `history[0].step=8`，说明评估了 8 个模板），取 fitness 最高的作为起点
-2. **候选生成**（`_generate_candidates`）：每轮生成 `num_candidates=10` 个候选 DAG，每个候选是 *单条边的 add/remove*：
-   - 60% 概率 add 一条随机边（若不成环）
-   - 40% 概率 remove 一条随机现有边
-3. **贪心评估**：遍历候选，**找到第一个 fitness > best** 就接受并重新生成候选（`break`）
-4. **早停**：连续 `patience=5` 轮无改进退出
+**Flow**:
+1. **Template warm-start**: run every DAG in `init_templates` (history shows `history[0].step=8`, i.e. 8 templates evaluated), pick the highest-fitness one.
+2. **Candidate generation** (`_generate_candidates`): per round, produce `num_candidates=10` DAGs, each a **single-edge** add/remove:
+   - 60% probability: add a random edge (if acyclic)
+   - 40% probability: remove a random existing edge
+3. **Greedy evaluation**: iterate candidates, **accept the first with fitness > best**, regenerate candidates (`break`).
+4. **Early stop**: exit after `patience=5` consecutive no-improvement rounds.
 
-**关键性质**：
-- **Fitness hill-climbing，无探索温度**
-- **Early accept**：找到第一个改进就停，不看其它候选
-- **Template warm-start 消耗 8/30 budget**（27%）
-- **Single-edge neighborhood**：每步只能改 ±1 条边（相对 3072 条总边，扰动比 0.03%）
+**Key properties**:
+- **Fitness hill-climbing, no exploration temperature**
+- **Early accept**: first improvement wins, other candidates ignored
+- **Template warm-start consumes 8/30 of the budget** (27%)
+- **Single-edge neighborhood**: ±1 edge per step (out of 3072 total edges = 0.03% perturbation)
 
-### 1.4 数据 artifact
+### 1.4 Data artifacts
 
-| 路径 | 内容 |
+| Path | Contents |
 |---|---|
-| `runs/research_20260411_030422/stage2_discovery/search_histories/gsm8k/prompt_*.json` | 1319 条 prompt 搜索历史（每个含 `history` trajectory） |
-| `runs/research_20260411_030422/stage2_discovery/episodes.db` | SQLite，1319 rows，每行含最终 DAG `dag_json` + output + correct |
-| `runs/research_20260411_030422/stage2_discovery/best_dag_per_prompt.json` | prompt → best_strategy/correct/num_strategies_tried 索引 |
+| `runs/research_20260411_030422/stage2_discovery/search_histories/gsm8k/prompt_*.json` | 1319 prompt search histories (each with a `history` trajectory) |
+| `runs/research_20260411_030422/stage2_discovery/episodes.db` | SQLite, 1319 rows, final `dag_json` + output + correct |
+| `runs/research_20260411_030422/stage2_discovery/best_dag_per_prompt.json` | prompt → best_strategy / correct / num_strategies_tried |
 
 ---
 
-## 2. 核心事实
+## 2. Core facts
 
-### 2.1 挽救率 = 0
+### 2.1 Rescue rate = 0
 
-（scope：`research_20260411_030422` 单次运行，1319 prompts）
+(Scope: single run `research_20260411_030422`, 1319 prompts.)
 
 |              | final_fail | final_ok | All  |
 |--------------|-----------:|---------:|-----:|
@@ -73,148 +75,149 @@
 | **init_ok**   |        0   |    1182  | 1182 |
 | **All**       |      137   |    1182  | 1319 |
 
-- 初始失败的 137 条，搜索 30 步后 **rescue = 0 / 137 = 0.0%**
-- 初始成功的 1182 条，**0 条被搞坏**
-- **搜索净 Δacc = 0.000 pp**
+- Of the 137 initially failing prompts, **rescue = 0 / 137 = 0.0%** after 30 search steps.
+- Of the 1182 initially correct prompts, **0 were broken**.
+- **Net Δacc from search = 0.000 pp**.
 
-（更早的 1533/151 数字是多 run 聚合，单 run 数字以此为准）
+(The earlier 1533/151 numbers came from aggregating multiple runs; single-run numbers above are authoritative.)
 
-### 2.2 Init_fail 的 fitness 恒定为 0
+### 2.2 Fitness stays 0 on init_fail prompts
 
-手抽两条（`prompt_0002`、`prompt_0007`）：
+Spot-check (`prompt_0002`, `prompt_0007`):
 
 ```
-init:  fitness=0.00  edges=3072  step=8   (warm-start 选中 CoT 模板)
+init:  fitness=0.00  edges=3072  step=8   (warm-start selected CoT template)
 ...
 last:  fitness=0.00  edges=3073  step=30
 fitness trajectory:  min=0.00  max=0.00  final=0.00
-edges range:        3071 – 3073   (30 步内仅 ±1 条边扰动)
+edges range:        3071 – 3073   (30 steps of ±1 edge perturbation)
 ```
 
-**所有 137 条 init_fail，23 步候选评估里 fitness 从未变过 0**。greedy 本身是 hill-climbing，在绝对平坦的 plateau 上无信号可走。patience 没用，因为没有"任何改进"触发过 reset。
+**Across all 137 init_fail prompts, fitness never moved from 0** during the 23-step candidate-evaluation phase. Greedy hill-climbing has no signal on a perfectly flat plateau; `patience` never triggers because nothing ever improves.
 
-### 2.3 搜索空间实际非常小
+### 2.3 The search space is effectively tiny
 
-- 1319 条 prompt 的最终 best DAG 只有 **28 个 unique 结构**
-- 其中 22 个只出现 1 次
-- 主导模板 edges=3072, depth=4, max_width=32（即标准 4-block semi-AR），占 86%（1134/1319）
-- 搜索基本 = "从 CoT 模板起步，扰动 ±1 条边找不到改进，返回原点"
+- Across 1319 prompts, the final best DAG has only **28 unique structures**.
+- 22 of them appear exactly once.
+- The dominant template (edges=3072, depth=4, max_width=32 — standard 4-block semi-AR) accounts for **86% (1134/1319)**.
+- Search ≈ "start from CoT template, perturb ±1 edge, find no improvement, return to origin".
 
-### 2.4 "非默认 DAG acc=100%" 是 selection artifact
+### 2.4 "Non-default DAG acc=100%" was a selection artifact
 
-之前误读的"185 条非默认 DAG 100% acc"——实际是：
-- Template warm-start 阶段就 hit 到一个非 CoT 模板 → init_fitness=1.0 → early-stop，保存那个模板
-- 这些 prompt 对**所有 warm-start 候选模板**都能做对（属于 easy case），不是某个特殊 DAG "救" 了它们
-- 相关性 ≠ 因果性
-
----
-
-## 3. 结论
-
-**在 v1.5.3 的 llada-instruct + T=0 + GreedyEdgeSearch(budget=30, single-edge mutation) 配置下，static position-level DAG search 对 gsm8k 最终 accuracy 没有因果影响**。
-
-之前报告里 "+3.6pp" / "非默认 DAG 救 14%" 的说法**全部作废**，源自：
-1. 把"greedy warm-start 首个 template 命中"误读为"search 收敛结果"
-2. 混淆 `default_fp` 与 "semi-AR baseline" — 实际 default_fp 是 CoT template，不是 baseline
+The earlier "185 prompts with non-default DAG at 100% acc" claim was misread:
+- Template warm-start happened to hit a non-CoT template with init_fitness=1.0 → early-stop → that template was saved.
+- These prompts are already solvable by **any** warm-start template (they are easy cases) — no specific DAG "rescued" them.
+- Correlation ≠ causation.
 
 ---
 
-## 4. 为什么挽救率是 0？三个假设（未证伪）
+## 3. Conclusion
 
-### H1: Commit-once-never-revise 是 MDLM 采样瓶颈
-`remasking="low_confidence"` 虽然允许 remask，但 llada 的 block-wise 策略一旦 commit 就不会跨 block 回改。错 token 固化后，DAG 只能影响"接下来哪个 mask 先填"，填的时候上下文已经污染，predictor 再怎么按 DAG 顺序来也吐同样的错。
-→ **D / F / H 方向（correction head / PC corrector / CDD constraint）直接针对这个**。
+**Under the v1.5.3 configuration (llada-instruct + T=0 + GreedyEdgeSearch budget=30, single-edge mutation), static position-level DAG search has no causal effect on final gsm8k accuracy.**
 
-### H2: T=0 + 双向 attention 让 unmask order 几乎失效
-双向 transformer 在固定 "已 unmask 集合" 下产生固定 logits，argmax 不依赖顺序。DAG 能影响的只剩：
-- 每步 unmask 的 batch 大小（即 level width）
-- 哪个 position 属于哪个 level
-而且 single-edge mutation 动不了 level 结构（3072 条边改 1 条，拓扑层几乎不变）。
-→ 搜索步长 × 评估粒度 × 贪心接受三者叠加，信号被噪声淹没。
-
-### H3: llada 在 gsm8k 的 137 条 init_fail 上达到能力上限
-无论 order / remasking 怎么改，这些 prompt 需要的推理能力超出 llada-instruct 的 token-level 表征。
-→ 只有训练端（reasoning reward RL / trajectory distill）能动。
+The earlier "+3.6pp" / "non-default DAG rescues 14%" claims are **invalidated**, caused by:
+1. Mistaking "warm-start template hit" for "search convergence".
+2. Confusing `default_fp` with a "semi-AR baseline" — `default_fp` is a CoT template, not a baseline.
 
 ---
 
-## 5. 下一步探索（区分 H1/H2/H3）
+## 4. Why is rescue zero? Three hypotheses (not yet falsified)
 
-| 实验 | 做法 | 证伪哪条 | 成本 |
+### H1: Commit-once-never-revise is the MDLM sampling bottleneck
+`remasking="low_confidence"` permits remasking in principle, but LLaDA's block-wise policy never revises cross-block once a token is committed. A wrong token pollutes the context; the DAG only controls **which mask fills next**, not whether the wrong token gets corrected — so the predictor emits the same error regardless of order.
+→ **Directions D / F / H (correction head / PC corrector / CDD constraint) target this directly**.
+
+### H2: T=0 + bidirectional attention makes unmask order nearly irrelevant
+A bidirectional transformer produces fixed logits given a fixed "already-unmasked set"; argmax does not depend on order. The DAG can only influence:
+- Batch size per step (level width)
+- Which position belongs to which level
+
+Single-edge mutation cannot change level structure (3072 edges, ±1 barely moves the topology).
+→ Step size × evaluation granularity × greedy accept together drown any signal in noise.
+
+### H3: LLaDA hits its capability ceiling on these 137 init_fail prompts
+Regardless of order or remasking, solving these prompts requires reasoning capability beyond llada-instruct's token-level representations.
+→ Only training-side interventions (reasoning-reward RL, trajectory distillation) can move the needle.
+
+---
+
+## 5. Next experiments (to distinguish H1/H2/H3)
+
+| Experiment | Method | Falsifies | Cost |
 |---|---|---|---|
-| **D. Failing-case forensics** | 拿 10 条 `init_fail` 的 output + ground_truth 手 diff，看错在哪个 token、是早期/晚期错 | 直观判断 H1 vs H3 | 0.5 h（读 `episodes.db` 即可） |
-| **A. Remasking ablation** | 给 137 条 init_fail 加一个最简 revise hook（conf < τ 时重采样整个 block），测 rescue | H1：rescue > 5% 证实 | 0.5 d |
-| **B. Temperature sweep** | 对 137 条跑 T ∈ {0.0, 0.3, 0.7, 1.0}, N=8 次采样, 算 pass@N | H3：pass@N ≈ 0 → H3 成立；>0 → 采样 diversity 有价值 | 0.5 d（纯推理） |
-| **C. Bigger DAG mutation** | 改 `_generate_candidates` 一次性动 10+ 条边 / 整个 level，重跑 greedy | H2：若仍 rescue=0 → order 表达力确实无用 | 0.5 d |
+| **D. Failing-case forensics** | Take 10 `init_fail` prompts, diff output vs ground_truth by hand, locate the first wrong token | H1 vs H3 via inspection | 0.5 h (read `episodes.db`) |
+| **A. Remasking ablation** | On 137 init_fail, add a minimal revise hook (resample whole block when conf < τ); measure rescue | H1: rescue > 5% confirms | 0.5 d |
+| **B. Temperature sweep** | 137 prompts × T ∈ {0.0, 0.3, 0.7, 1.0}, N=8 samples, compute pass@N | H3: pass@N ≈ 0 → H3 holds; > 0 → sampling diversity has value | 0.5 d (inference only) |
+| **C. Bigger DAG mutation** | Change `_generate_candidates` to mutate 10+ edges / whole levels per step, rerun greedy | H2: if still rescue=0 → order expressiveness truly useless | 0.5 d |
 
-**建议顺序**：先 D（0.5h 零成本），再 A（证伪 H1 成本最低且信息量最大）。
+**Suggested order**: D first (0.5h, zero cost), then A (cheapest way to falsify H1 with max info).
 
 ---
 
-## 6. 对 Plan 的影响
+## 6. Impact on the plan
 
-**降优先级**（若 D/A 证实 H1）：
+**Deprioritize** (if D/A confirm H1):
 - **G** Order-Token Joint Search
-- **E** Prism Tree Search 的 DAG 变体
-- `search/` 下的 differentiable / NAS / evolutionary — 都是 static DAG 空间上的搜索变体
+- **E** Prism Tree Search (DAG variant)
+- `search/` differentiable / NAS / evolutionary — all static-DAG-space search variants
 
-**升优先级**：
-- **D** BackPlay Correction Head — 正面攻击 commit-once 问题
-- **F** PC Sampler + Duo Schedule — remasking 另一路径
-- **H** CDD Constrained Sampling — content-adaptive state-level 约束
+**Prioritize**:
+- **D** BackPlay Correction Head — attacks commit-once directly
+- **F** PC Sampler + Duo Schedule — alternate remasking path
+- **H** CDD Constrained Sampling — content-adaptive state-level constraints
 
-**保留但不以 DAG 为中心**：
-- `search/` 保留为 template 生成工具（多 template warm-start 用）
-- `scheduler/dag_scheduler.py` 保留作为 content-independent baseline
+**Keep but decenter from DAG**:
+- `search/` retained as a template-generation tool (multi-template warm-start)
+- `scheduler/dag_scheduler.py` retained as a content-independent baseline
 
 ---
 
 ## 7. Artifacts
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| `test.ipynb` | 初始发现（confusion matrix，part 1） |
-| `test_dag_deepdive.ipynb` | 28 unique DAG 结构 + prompt 特征分析 |
-| `test_dag_gain.ipynb` | 净增益再算（可复现） |
-| `docs/archive/finding_dag_search_zero_rescue.md` | 本文档 |
+| `test.ipynb` | Initial discovery (confusion matrix, part 1) |
+| `test_dag_deepdive.ipynb` | 28 unique DAG structures + prompt-feature analysis |
+| `test_dag_gain.ipynb` | Net-gain recomputation (reproducible) |
+| `docs/archive/finding_dag_search_zero_rescue.md` | This document |
 
-**原始数据**：`runs/research_20260411_030422/stage2_discovery/`
+**Raw data**: `runs/research_20260411_030422/stage2_discovery/`
 
-**相关代码入口**：
+**Relevant code entry points**:
 - `src/dllm_reason/search/greedy.py::GreedyEdgeSearch`
-- `src/dllm_reason/graph/templates.py`（warm-start 模板池）
+- `src/dllm_reason/graph/templates.py` (warm-start template pool)
 - `configs/search/greedy.yaml`
 - `configs/eval_default.yaml`
 
 ---
 
-## 8. 复现证据：NAS Supernet 同样 0 rescue（2026-04-15）
+## 8. Replication: NAS supernet also gives 0 rescue (2026-04-15)
 
-**目的**：排除"greedy 陷入局部极值"这一可能，换一个完全不同的搜索算法（NAS supernet，带温度退火 + 梯度/熵驱动）再跑一次。
+**Goal**: rule out "greedy stuck in local minimum" by running a fundamentally different search algorithm (NAS supernet with temperature annealing + entropy-driven updates).
 
-**数据**：`runs/research_20260415_035714/stage2_discovery/`
-- 200 条 gsm8k prompt（不同子集）
-- `search_method = nas`，`budget = 50`
+**Data**: `runs/research_20260415_035714/stage2_discovery/`
+- 200 gsm8k prompts (different subset)
+- `search_method = nas`, `budget = 50`
 - `metadata = {method: nas_supernet, num_spans: 8, span_size: 16}`
-- 配置：T=0.0, block_length=32, num_steps=128（同原 v1.5.3 配置）
+- Config: T=0.0, block_length=32, num_steps=128 (same as v1.5.3)
 
-**结果**：
+**Result**:
 
-| 指标 | 值 |
+| Metric | Value |
 |---|---|
-| init baseline 正确 | 95 / 200 (47.5%) |
-| init baseline 错误 | 105 / 200 |
-| search 救回 (fail→ok) | **0 / 105** |
-| search 打破 (ok→fail) | 0 / 95 |
-| 净 Δacc | **+0.0 pp** |
-| 所有 prompt 的 `best_dag_edges` | **全 = 0**（search 全部收敛到空 DAG）|
-| history 中 fitness 有任何变化的 prompt | **0 / 200** |
+| init baseline correct | 95 / 200 (47.5%) |
+| init baseline wrong | 105 / 200 |
+| search rescue (fail→ok) | **0 / 105** |
+| search break (ok→fail) | 0 / 95 |
+| net Δacc | **+0.0 pp** |
+| all prompts' `best_dag_edges` | **all = 0** (search converges to empty DAG) |
+| prompts where fitness moved at all | **0 / 200** |
 
-**关键差异**：
-- greedy (v1.5.3) 从 CoT 模板 3072 edges 出发 ±1 抖动 → 停在 3072 附近
-- NAS supernet 从某处 supernet 出发温度退火 (τ: 1.24 → 0.1)，熵从 2.83 → 0.04 —— **熵降了，但 num_edges 全程 = 0**
+**Key contrast**:
+- Greedy (v1.5.3) starts from CoT template at 3072 edges and jitters ±1 → stays near 3072.
+- NAS supernet starts from a supernet with temperature annealing (τ: 1.24 → 0.1); entropy drops 2.83 → 0.04 — **entropy falls, but num_edges stays 0 throughout**.
 
-**NAS history sample**（`prompt_0002`, init_fail）：
+**NAS history sample** (`prompt_0002`, init_fail):
 ```json
 [
   {"fitness": 0.0, "step": 0},
@@ -224,6 +227,6 @@ edges range:        3071 – 3073   (30 步内仅 ±1 条边扰动)
 ]
 ```
 
-**结论加强**：DAG 结构空间里"空 DAG"就是全局最优（在 T=0 llada-instruct + gsm8k 组合下）。不是 greedy 的问题，不是 budget 的问题，**是 DAG 轴整个就没有信号**。
+**Strengthened conclusion**: the empty DAG is the global optimum in DAG structure space (under T=0 llada-instruct + gsm8k). This is not a greedy problem, not a budget problem — **the DAG axis carries no signal at all**.
 
-这进一步排除了"搜索算法不够强"这一解释，H1 / H2 / H3 的证据地位不变，DAG 方向降权结论**加强**。
+This rules out the "search algorithm not strong enough" explanation. H1 / H2 / H3 retain their evidence standing; the DAG-deprioritization conclusion is **reinforced**.

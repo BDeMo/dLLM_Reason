@@ -1,4 +1,4 @@
-"""扫 runs/validation/h{1,2,3}_*/summary.json，更新 hypotheses.md 结论板。
+"""扫 runs/validation/h{1,2,3}_*/summary.json，更新 hypotheses{.md, .zh.md} 结论板。
 
 策略：对每个 hypothesis 取**最新时间戳**的 run_dir 作为权威结果。
 idempotent — 重复跑只会用最新 summary 覆盖对应行。
@@ -15,7 +15,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VAL = ROOT / "runs" / "validation"
-HYP_MD = ROOT / "docs" / "archive" / "hypotheses.md"
+HYP_MD_EN = ROOT / "docs" / "archive" / "hypotheses.md"
+HYP_MD_ZH = ROOT / "docs" / "archive" / "hypotheses.zh.md"
 
 
 def latest_summary(pattern: str) -> dict | None:
@@ -64,30 +65,24 @@ def fmt_h0() -> tuple[str, str]:
         return "—", "—"
 
 
-def update_md(rows: dict[str, tuple[str, str, str]]) -> None:
-    """rows: {H_key: (script, verdict, nums)}"""
-    md = HYP_MD.read_text(encoding="utf-8")
+def _rewrite_table(md_path: Path, table_header: str,
+                   rows: dict[str, tuple[str, str, str]]) -> None:
+    if not md_path.exists():
+        return
+    md = md_path.read_text(encoding="utf-8")
     today = datetime.now().strftime("%Y-%m-%d")
-
-    table_header = "| 假设 | 脚本 | Verdict | 关键数字 | 日期 |"
     lines = md.splitlines()
     try:
         hi = lines.index(table_header)
     except ValueError:
-        print(f"[aggregate] 找不到表头 '{table_header}'，请检查 hypotheses.md")
+        print(f"[aggregate] 找不到表头 '{table_header}' @ {md_path.name}，跳过")
         return
-
-    # 表头之后 2 行开始为数据（header + 分隔 + 数据）
     data_start = hi + 2
     new_lines = lines[:data_start]
-
     for key in ("H0", "H1", "H2", "H3"):
         script, verdict, nums = rows.get(key, ("—", "—", "—"))
         date = today if verdict not in ("—",) else "—"
         new_lines.append(f"| {key} | `{script}` | {verdict} | {nums} | {date} |")
-
-    # 剩余非表格内容保留（例如末尾空行）
-    # 找表格结束位置（连续的 | 行）
     tail_start = data_start
     for i in range(data_start, len(lines)):
         if not lines[i].startswith("|"):
@@ -96,8 +91,14 @@ def update_md(rows: dict[str, tuple[str, str, str]]) -> None:
     else:
         tail_start = len(lines)
     new_lines.extend(lines[tail_start:])
+    md_path.write_text("\n".join(new_lines) + ("\n" if md.endswith("\n") else ""),
+                       encoding="utf-8")
 
-    HYP_MD.write_text("\n".join(new_lines) + ("\n" if md.endswith("\n") else ""), encoding="utf-8")
+
+def update_md(rows: dict[str, tuple[str, str, str]]) -> None:
+    """rows: {H_key: (script, verdict, nums)}. Updates both EN and ZH tables."""
+    _rewrite_table(HYP_MD_EN, "| Hypothesis | Script | Verdict | Key numbers | Date |", rows)
+    _rewrite_table(HYP_MD_ZH, "| 假设 | 脚本 | Verdict | 关键数字 | 日期 |", rows)
 
 
 def main():
@@ -134,7 +135,9 @@ def main():
         print(f"  {k}: {v:<14} | {n}")
 
     update_md(rows)
-    print(f"\n[aggregate] 已更新 {HYP_MD.relative_to(ROOT)}")
+    for p in (HYP_MD_EN, HYP_MD_ZH):
+        if p.exists():
+            print(f"\n[aggregate] 已更新 {p.relative_to(ROOT)}")
     for name, s in (("H1", h1s), ("H2", h2s), ("H3", h3s)):
         if s:
             print(f"  {name} run: {s['_run_dir']}")
