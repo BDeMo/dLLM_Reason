@@ -34,3 +34,4 @@ wandb/
 # Scratch notebooks
 test*.ipynb
 paper/
+docs/dLLM_Reason.pdf
