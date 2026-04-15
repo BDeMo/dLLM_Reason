@@ -185,3 +185,45 @@ edges range:        3071 – 3073   (30 步内仅 ±1 条边扰动)
 - `src/dllm_reason/graph/templates.py`（warm-start 模板池）
 - `configs/search/greedy.yaml`
 - `configs/eval_default.yaml`
+
+---
+
+## 8. 复现证据：NAS Supernet 同样 0 rescue（2026-04-15）
+
+**目的**：排除"greedy 陷入局部极值"这一可能，换一个完全不同的搜索算法（NAS supernet，带温度退火 + 梯度/熵驱动）再跑一次。
+
+**数据**：`runs/research_20260415_035714/stage2_discovery/`
+- 200 条 gsm8k prompt（不同子集）
+- `search_method = nas`，`budget = 50`
+- `metadata = {method: nas_supernet, num_spans: 8, span_size: 16}`
+- 配置：T=0.0, block_length=32, num_steps=128（同原 v1.5.3 配置）
+
+**结果**：
+
+| 指标 | 值 |
+|---|---|
+| init baseline 正确 | 95 / 200 (47.5%) |
+| init baseline 错误 | 105 / 200 |
+| search 救回 (fail→ok) | **0 / 105** |
+| search 打破 (ok→fail) | 0 / 95 |
+| 净 Δacc | **+0.0 pp** |
+| 所有 prompt 的 `best_dag_edges` | **全 = 0**（search 全部收敛到空 DAG）|
+| history 中 fitness 有任何变化的 prompt | **0 / 200** |
+
+**关键差异**：
+- greedy (v1.5.3) 从 CoT 模板 3072 edges 出发 ±1 抖动 → 停在 3072 附近
+- NAS supernet 从某处 supernet 出发温度退火 (τ: 1.24 → 0.1)，熵从 2.83 → 0.04 —— **熵降了，但 num_edges 全程 = 0**
+
+**NAS history sample**（`prompt_0002`, init_fail）：
+```json
+[
+  {"fitness": 0.0, "step": 0},
+  {"fitness": 0.0, "step": 20, "h": 2.83, "tau": 1.24, "num_edges": 0},
+  {"fitness": 0.0, "step": 40, "h": 1.63, "tau": 0.48, "num_edges": 0},
+  {"fitness": 0.0, "step": 50, "h": 0.037, "tau": 0.10, "num_edges": 0}
+]
+```
+
+**结论加强**：DAG 结构空间里"空 DAG"就是全局最优（在 T=0 llada-instruct + gsm8k 组合下）。不是 greedy 的问题，不是 budget 的问题，**是 DAG 轴整个就没有信号**。
+
+这进一步排除了"搜索算法不够强"这一解释，H1 / H2 / H3 的证据地位不变，DAG 方向降权结论**加强**。
