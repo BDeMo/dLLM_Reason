@@ -97,6 +97,6 @@
 | Hypothesis | Script | Verdict | Key numbers | Date |
 |---|---|---|---|---|
 | H0 | `h0_forensics.py` | DONE | 137 fail prompts → runs/validation/scope_fail_prompts.json | 2026-04-15 |
-| H1 | `h1_remask_rescue.py` | — | — | — |
-| H2 | `h2_order_vs_content.py` | — | — | — |
+| H1 | `h1_remask_rescue.py` | REJECTED | N=137  base=0  revise=0  rescued=0  broken=0  rescue_rate=0.00% | 2026-04-15 |
+| H2 | `h2_order_vs_content.py` | REJECTED | N=20  content_var=0.256  order_var=0.176  ratio=0.754 | 2026-04-15 |
 | H3 | `h3_passN_at_temperature.py` | — | — | — |

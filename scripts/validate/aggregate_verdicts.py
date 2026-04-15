@@ -65,18 +65,27 @@ def fmt_h0() -> tuple[str, str]:
         return "—", "—"
 
 
-def _rewrite_table(md_path: Path, table_header: str,
-                   rows: dict[str, tuple[str, str, str]]) -> None:
+# 可能的表头（EN / ZH 任何一个命中就更新）
+KNOWN_HEADERS = [
+    "| Hypothesis | Script | Verdict | Key numbers | Date |",
+    "| 假设 | 脚本 | Verdict | 关键数字 | 日期 |",
+]
+
+
+def _rewrite_table(md_path: Path, rows: dict[str, tuple[str, str, str]]) -> bool:
     if not md_path.exists():
-        return
+        return False
     md = md_path.read_text(encoding="utf-8")
     today = datetime.now().strftime("%Y-%m-%d")
     lines = md.splitlines()
-    try:
-        hi = lines.index(table_header)
-    except ValueError:
-        print(f"[aggregate] 找不到表头 '{table_header}' @ {md_path.name}，跳过")
-        return
+    hi = -1
+    for hdr in KNOWN_HEADERS:
+        if hdr in lines:
+            hi = lines.index(hdr)
+            break
+    if hi < 0:
+        print(f"[aggregate] 未在 {md_path.name} 中找到已知表头，跳过（请确认已 git pull 最新 archive 模板）")
+        return False
     data_start = hi + 2
     new_lines = lines[:data_start]
     for key in ("H0", "H1", "H2", "H3"):
@@ -93,12 +102,13 @@ def _rewrite_table(md_path: Path, table_header: str,
     new_lines.extend(lines[tail_start:])
     md_path.write_text("\n".join(new_lines) + ("\n" if md.endswith("\n") else ""),
                        encoding="utf-8")
+    return True
 
 
 def update_md(rows: dict[str, tuple[str, str, str]]) -> None:
-    """rows: {H_key: (script, verdict, nums)}. Updates both EN and ZH tables."""
-    _rewrite_table(HYP_MD_EN, "| Hypothesis | Script | Verdict | Key numbers | Date |", rows)
-    _rewrite_table(HYP_MD_ZH, "| 假设 | 脚本 | Verdict | 关键数字 | 日期 |", rows)
+    """rows: {H_key: (script, verdict, nums)}. Updates EN and ZH tables if present."""
+    for p in (HYP_MD_EN, HYP_MD_ZH):
+        _rewrite_table(p, rows)
 
 
 def main():
