@@ -87,13 +87,14 @@
 
 ---
 
-## 结论板（跑完后 append）
+## 结论板（自动更新）
 
-> _待填：每条假设跑完后在此记录 verdict、关键数字、脚本产出路径、时间戳_
+> 由 `scripts/validate/aggregate_verdicts.py` 扫 `runs/validation/h{1,2,3}_*/summary.json` 的最新时间戳自动覆盖。
+> 手动加注释请写在本表**上方**，表格内容每次 aggregate 都会被重写。
 
 | 假设 | 脚本 | Verdict | 关键数字 | 日期 |
 |---|---|---|---|---|
-| H0 | `h0_forensics.py` | — | — | — |
+| H0 | `h0_forensics.py` | DONE | 137 fail prompts → runs/validation/scope_fail_prompts.json | 2026-04-15 |
 | H1 | `h1_remask_rescue.py` | — | — | — |
 | H2 | `h2_order_vs_content.py` | — | — | — |
 | H3 | `h3_passN_at_temperature.py` | — | — | — |
