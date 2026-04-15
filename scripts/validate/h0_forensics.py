@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = ROOT / "runs" / "validation"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT = OUT_DIR / "scope_fail_prompts.json"
+OUT_OK = OUT_DIR / "scope_ok_prompts.json"
 
 
 def find_latest_db() -> Path | None:
@@ -98,10 +99,23 @@ def main():
         print(f"     gt={row.ground_truth!r}")
         print(f"     out tail: ...{row.output[-200:]!r}")
 
-    # 保存
+    # 保存 fail
     records = df.to_dict(orient="records")
     OUT.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[H0] saved {len(records)} fail prompts → {OUT.relative_to(ROOT)}")
+
+    # 同步落盘 init_ok 对照组（H3 需要）
+    conn = sqlite3.connect(db_path)
+    df_ok = pd.read_sql_query(
+        "SELECT episode_id, prompt, ground_truth, output, correct, "
+        "dag_seq_len, num_steps, block_length FROM episodes WHERE correct=1",
+        conn,
+    )
+    conn.close()
+    ok_records = df_ok.to_dict(orient="records")
+    OUT_OK.write_text(json.dumps(ok_records, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[H0] saved {len(ok_records)} ok   prompts → {OUT_OK.relative_to(ROOT)} (H3 对照组)")
+
     print("[H0] 无 verdict（H0 是 scope 生成，非假设验证）")
 
 

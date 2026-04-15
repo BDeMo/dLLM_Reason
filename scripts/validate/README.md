@@ -6,7 +6,8 @@
 
 ```
 runs/validation/
-├── scope_fail_prompts.json           # H0 产出，复用
+├── scope_fail_prompts.json           # H0 产出：init_fail (correct=0)，H1/H2/H3 复用
+├── scope_ok_prompts.json             # H0 产出：init_ok   (correct=1)，H3 对照组
 ├── h1_remask_<ts>/
 │   ├── config.json                   # CLI + hypothesis + timestamp
 │   ├── per_prompt/

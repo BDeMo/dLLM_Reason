@@ -15,6 +15,10 @@ Verdict 阈值：
 每条 prompt 一个 per_prompt/XXXX.json，文件名用 "{group}_{idx:04d}.json"
 (group ∈ {"fail", "ok"})，支持 resume。
 
+依赖：
+    runs/validation/scope_fail_prompts.json  (H0 产出)
+    runs/validation/scope_ok_prompts.json    (H0 产出，init_ok 对照组)
+
 Usage:
     python scripts/validate/h3_passN_at_temperature.py --n_fail 2 --n_ok 2 --dry_run
     python scripts/validate/h3_passN_at_temperature.py --n_fail 30 --n_ok 30 --n_samples 8
@@ -23,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -33,21 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 ROOT = Path(__file__).resolve().parents[2]
 SCOPE = ROOT / "runs" / "validation" / "scope_fail_prompts.json"
+SCOPE_OK = ROOT / "runs" / "validation" / "scope_ok_prompts.json"
 OUT_BASE = ROOT / "runs" / "validation"
-
-
-def find_latest_db() -> Path | None:
-    cands = sorted((ROOT / "runs").glob("research_*/stage2_discovery/episodes.db"))
-    return cands[-1] if cands else None
-
-
-def load_init_ok(k: int, db_path: Path):
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT prompt, ground_truth FROM episodes WHERE correct=1 LIMIT ?", (k,))
-    rows = cur.fetchall()
-    conn.close()
-    return [{"prompt": p, "ground_truth": gt} for p, gt in rows]
 
 
 def pass_at_k(corrects: list[bool], k: int) -> float:
@@ -134,25 +124,13 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
-    ap.add_argument("--db", type=str, default=None,
-                    help="episodes.db 路径，留空则自动取 runs/research_*/stage2_discovery/episodes.db 最新一个")
     add_common_args(ap)
     args = ap.parse_args()
 
     assert SCOPE.exists(), f"先跑 h0_forensics.py 生成 {SCOPE}"
+    assert SCOPE_OK.exists(), f"先跑 h0_forensics.py 生成 {SCOPE_OK}（H3 需要 init_ok 对照组）"
     fail_prompts = json.loads(SCOPE.read_text(encoding="utf-8"))[: args.n_fail]
-
-    db_path = Path(args.db) if args.db else find_latest_db()
-    if args.dry_run and (db_path is None or not db_path.exists()):
-        ok_prompts = [{"prompt": "(dry_run placeholder)", "ground_truth": "0"}] * args.n_ok
-        print(f"[H3] DRY RUN: 无 db，使用 placeholder ok prompts")
-    else:
-        assert db_path is not None and db_path.exists(), (
-            f"DB not found: {db_path}\n"
-            f"显式传 --db 或确保 runs/research_*/stage2_discovery/episodes.db 存在"
-        )
-        print(f"[H3] using DB: {db_path.relative_to(ROOT) if db_path.is_relative_to(ROOT) else db_path}")
-        ok_prompts = load_init_ok(args.n_ok, db_path)
+    ok_prompts = json.loads(SCOPE_OK.read_text(encoding="utf-8"))[: args.n_ok]
     print(f"[H3] fail={len(fail_prompts)}  ok={len(ok_prompts)}  "
           f"temps={args.temps}  N={args.n_samples}")
 
