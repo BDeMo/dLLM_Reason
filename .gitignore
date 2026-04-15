@@ -33,3 +33,4 @@ wandb/
 
 # Scratch notebooks
 test*.ipynb
+paper/
