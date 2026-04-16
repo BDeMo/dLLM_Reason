@@ -34,6 +34,7 @@ from dllm_reason.models.base import DiffusionLM, DiffusionOutput
 from dllm_reason.utils.registry import MODEL_REGISTRY
 from dllm_reason.utils.logging import get_logger
 from dllm_reason.utils.local_resolve import resolve_model_path
+from dllm_reason.utils.llada_checkpoint_patch import ensure_llada_checkpoint_patched
 
 logger = get_logger(__name__)
 
@@ -67,6 +68,11 @@ class LLaDAWrapper(DiffusionLM):
             dtype = torch_dtype
         # Resolve local checkpoint path before downloading from HuggingFace
         model_id = resolve_model_path(model_id)
+
+        # Self-heal the checkpoint's `modeling_llada.py` for transformers >= 5.x
+        # (idempotent; no-op if already patched or if we're loading directly
+        # from the HF hub without a local copy).
+        ensure_llada_checkpoint_patched(model_id)
 
         # Load tokenizer first to get vocab info
         logger.info(f"Loading tokenizer from {model_id}")
