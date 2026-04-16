@@ -23,7 +23,9 @@ class RunDir:
 
     def __init__(self, run_dir: Path, hypothesis: str, config: dict,
                  resume: bool = False):
-        self.dir = Path(run_dir)
+        # Resolve to absolute so downstream `.relative_to(ROOT)` calls work
+        # regardless of whether the caller passed a relative or absolute path.
+        self.dir = Path(run_dir).resolve()
         self.per_prompt = self.dir / "per_prompt"
         self.progress = self.dir / "progress.jsonl"
         self.config_path = self.dir / "config.json"
