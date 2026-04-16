@@ -152,7 +152,7 @@
 | H0 | `h0_forensics.py` | DONE | 60 fail prompts → runs/validation/scope_fail_prompts.json | 2026-04-16 |
 | H1 | `h1_remask_rescue.py` | REJECTED | N=137  base=0  revise=0  rescued=0  broken=0  rescue_rate=0.00% | 2026-04-16 |
 | H2 | `h2_order_vs_content.py` | REJECTED | N=20  content_var=0.256  order_var=0.176  ratio=0.754 | 2026-04-16 |
-| H3 | `h3_passN_at_temperature.py` | REJECTED | n_fail=30  n_ok=26  fail_p@8=86.67%  ok_p@8=100.00% | 2026-04-16 |
+| H3 | `h3_passN_at_temperature.py` | REJECTED | n_fail=60  n_ok=30  fail_p@8=86.67%  ok_p@8=100.00% | 2026-04-16 |
 | A3 | `a3_span_revise.py` | REJECTED | N=60  base=42  revise=42  rescued=0  broken=0  rescue_rate=0.00% | 2026-04-16 |
 | A4 | `a4_block_rerank.py` | SUPPORTED | N=60  base(bl32)=42  any=47  rescue_rate=8.33%  [bl8=43 bl16=41 bl32=42 bl64=37 short_then_long=37] | 2026-04-16 |
 | A5 | `a5_prompt_template.py` | SUPPORTED | N=60  base=42  any=50  rescue_rate=13.33%  [baseline=42 cot_plain=35 cot_step=30 answer=45] | 2026-04-16 |
