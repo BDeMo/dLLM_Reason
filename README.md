@@ -615,6 +615,15 @@ scheduler = AdaptiveDynamicScheduler(influence_threshold=0.3, momentum=0.5)
 
 ### DAG Search (6 Methods)
 
+> ⚠️ **2026-04 empirical finding:** On GSM8K/LLaDA-8B, three independent DAG
+> search implementations (greedy ±1-edge, NAS supernet, E2E differentiable)
+> achieved **0% rescue rate** on the 137 failing prompts. At T=0 with
+> bidirectional attention, unmask order does not carry actionable signal.
+> The search infrastructure below is retained for completeness and future
+> architectures; effort has since moved to inference-time strategy search
+> (block_length × template × gen_length × temperature). See
+> [`docs/archive/finding_dag_search_zero_rescue.md`](docs/archive/finding_dag_search_zero_rescue.md).
+
 Automatically discover optimal DAG structures.
 
 ```python

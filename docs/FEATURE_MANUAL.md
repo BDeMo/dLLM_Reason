@@ -1,6 +1,6 @@
 # dLLM-Reason Feature Manual
 
-> Version: v1.5.0  |  Last updated: 2026-04-09  |  Language: English  |  中文: [FEATURE_MANUAL.zh.md](FEATURE_MANUAL.zh.md)
+> Version: v1.5.3  |  Last updated: 2026-04-16  |  Language: English  |  中文: [FEATURE_MANUAL.zh.md](FEATURE_MANUAL.zh.md)
 
 
 ## 0. Project Overview
@@ -172,6 +172,15 @@ class DAGSearcher:
 Population initialization defaults to `build_all_templates(seq_len)` as seeds.
 
 ### 5.1 Search Level Taxonomy
+
+> ⚠️ **2026-04 empirical finding:** On GSM8K / LLaDA-8B, three independent
+> search implementations (greedy, NAS supernet, E2E differentiable) all achieve
+> **0% rescue rate** on the 137 failing prompts. At T=0 with bidirectional
+> attention, unmask order does not carry actionable signal. The search
+> infrastructure is retained for completeness; the mainline effort has shifted
+> to inference-time strategy search over
+> `(block_length × template × gen_length × temperature)`. See
+> [`docs/archive/finding_dag_search_zero_rescue.md`](archive/finding_dag_search_zero_rescue.md).
 
 All search methods are organized into a hierarchy of increasing search space size.
 The core objective is finding the **optimal generation order** for discrete diffusion
