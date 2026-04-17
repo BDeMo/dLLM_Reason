@@ -265,7 +265,11 @@ for ((g=0; g<GPUS; g++)); do
     fi
     LOG="$LOG_DIR/client_shard${g}.log"
     echo "[SS-SH]   shard $g  prompts[$S:$E)  server=http://127.0.0.1:$PORT  LOG=$LOG"
-    nohup python "$ROOT/scripts/validate/strategy_search.py" \
+    # PYTHONUNBUFFERED=1 + python -u → line-buffered stdout/stderr so tail -f
+    # shows progress ticks immediately (Python defaults to full-buffer when
+    # stdout is redirected to a file, hiding output until the buffer fills
+    # or the process exits).
+    PYTHONUNBUFFERED=1 nohup python -u "$ROOT/scripts/validate/strategy_search.py" \
         --run_dir "$RUN_DIR" \
         --resume \
         --server_url "http://127.0.0.1:$PORT" \
@@ -307,7 +311,7 @@ fi
 # ── Final aggregate pass (no slice, no skip_summary) ──────────────────────────
 echo "[SS-SH]"
 echo "[SS-SH] all shards complete. running final aggregation pass ..."
-python "$ROOT/scripts/validate/strategy_search.py" \
+PYTHONUNBUFFERED=1 python -u "$ROOT/scripts/validate/strategy_search.py" \
     --run_dir "$RUN_DIR" \
     --resume \
     --server_url "http://127.0.0.1:$BASE_PORT" \
