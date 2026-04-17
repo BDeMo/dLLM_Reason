@@ -70,12 +70,17 @@ Hypothesis: the default `gen_length=128` is not optimal for all prompts; differe
 
 A axis sweep complete; B axis assessment updated.
 
-### B1 — pass@N diversity sampling · **SUPPORTED (= H3)**
-H3 (`h3_passN_at_temperature.py`) is complete.
+### B1 — pass@N diversity sampling · **Strongest single-dimension lever (= H3, n=60)**
+H3 (`h3_passN_at_temperature.py`) has been re-run on the full n=60 fail set (`h3_passN_20260415_133254`).
 
-**Final result (N=30 fail)**: 7/30 rescue (idx=0,2,8,13,15,24,28), rescue_rate=**23.33%** → **SUPPORTED** (overturns earlier "likely INCONCLUSIVE" prediction). 4 prompts stuck (pass@8=0 at all temps).
+**Authoritative result (n=60 fail)**:
+- `fail_pass@8_max = 86.67%` (T=1.0), `ok_pass@8_max = 100%` — per the hypotheses.md capacity-ceiling threshold → **REJECTED** (= capacity ceiling does not hold).
+- P6 crossref rescue count: H3 rescue = **52/60 (86.67%)**, H3 stuck = **8 prompts [4,5,14,19,41,42,48,51]**.
+- H3-only (missed by the entire A axis) = **42 prompts**; H3 ⊆ A-union is only **19.2%** (near-orthogonal to the A axis).
 
-H3 SUPPORTED means the capacity ceiling hypothesis is **REJECTED** — the model is not fundamentally incapable on these prompts, but rather the default configuration fails. Diversity sampling itself is a valid lever (23.33%), though cheaper A-axis knobs (template/layout/gen_length) achieve comparable or better results.
+In n=60 H3 **dominates the entire A axis** (A-union = 13/60 = 21.67%). The older n=30 "7/30 = 23.33%" was a small-sample artifact; on the full fail set, pass@N is the strongest single-dimension lever and is independent of the A axis.
+
+Trade-off: H3 costs 24× inference (3 temps × N=8 samples); A-union costs 1× but caps at 21.67%. For paper-story purposes, if inference cost is not a dealbreaker, pass@N is the most effective rescue.
 
 ### B2 — training-side pivot
 SFT on the 137 fail prompts (distilled from a stronger solver) or RL with a correctness reward.
@@ -94,22 +99,24 @@ Script: not yet written.
 ## Routing logic
 
 ```
-A3 REJECTED  — conf-based revise dead at all token/span granularities
-A4 SUPPORTED — block-layout rerank → 8.33% rescue
-A5 SUPPORTED — prompt-template rerank → 13.33% rescue
-A6 SUPPORTED — gen-length rerank → 20.00% rescue (strongest single axis)
-A4x5 joint   — 6-cell run 16.67%, perfectly validates overlap prediction
-H3 SUPPORTED — pass@N 23.33% rescue (capacity ceiling REJECTED)
+A3 REJECTED   — conf-based revise dead at all token/span granularities
+A4 SUPPORTED  — block-layout rerank → 8.33% rescue
+A5 SUPPORTED  — prompt-template rerank → 13.33% rescue
+A6 SUPPORTED  — gen-length rerank → 20.00% rescue (strongest A-axis knob)
+A4x5 joint    — 6-cell run 16.67%, perfectly validates overlap prediction
+H3 (n=60)     — pass@8 = 86.67% rescue (capacity ceiling REJECTED; strongest lever)
 
-Rescue set cross-analysis:
-  A4∪A5 = 10, A4∪A5∪A6 = 13, full union = 15/18 = 83.3%
-  Only 3 prompts (idx=5,6,16) unsalvageable by any method = true capacity ceiling
-  Axes are mostly orthogonal: A6 contributes 3 unique, H3 contributes 3 unique
+Rescue set cross-analysis (n=60 authoritative, P6 crossref):
+  A4∪A5 = 10, A4∪A5∪A6 = 13, A-union = 13/60 (21.67%)
+  H3 = 52/60 (86.67%), H3 ∩ A-union = 10, H3 ⊆ A-union = 19.2%
+  Full union = A-union ∪ H3 = 55/60 = 91.67%
+  True capacity ceiling = 5/60 [4,5,14,41,42]
+  Axis-only: h3_only=42, a6_only=[19,51], a4_only=a5_only=[]
 ```
 
 **Next-step priorities — per-prompt strategy search pipeline**:
 
-The A axis is thoroughly swept; the full-method union of 83.3% shows the inference-time knob space is large enough. The next phase shifts from "which axis has signal" to "find the optimal configuration per prompt":
+The A axis is thoroughly swept; the full-method union of **91.67% (55/60)** shows the inference-time knob space is large enough. The next phase shifts from "which axis has signal" to "find the optimal configuration per prompt":
 
 1. **Per-prompt strategy search**: for each prompt, search the optimal `(block_length × template × gen_length × temperature)` combination, store `(prompt, best_strategy)` pairs.
 2. **New dimension: template_position**: a diffusion-LM-specific scaffold/inpainting approach — place template tokens at arbitrary positions within the generation region (not just as suffix). This is impossible with AR LMs.

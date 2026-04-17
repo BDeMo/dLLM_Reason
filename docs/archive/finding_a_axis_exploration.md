@@ -2,7 +2,7 @@
 
 > Language: English  |  中文: [finding_a_axis_exploration.zh.md](finding_a_axis_exploration.zh.md)
 
-**Date**: 2026-04-15 (live, updated as H3 results land)
+**Date**: 2026-04-15 (initial) / 2026-04-16 (synced after H3 rerun at n=60 + P6 crossref)
 
 **Companion docs**:
 - [`hypotheses.md`](hypotheses.md) — formal hypothesis registry, verdict board
@@ -13,7 +13,7 @@
 
 ## TL;DR
 
-After three independent DAG search implementations and two token-level revise experiments all returned **0 rescue**, the A axis produced three positive signals at coarse granularities: A4 block-layout rerank (5/60 = 8.33%), A5 prompt-template rerank (8/60 = 13.33%), and **A6 gen-length rerank (12/60 = 20.00%, strongest single axis)**. H3 pass@N came back SUPPORTED (7/30 = 23.33%). Full-method union 15/18 = 83.3%, only 3 prompts are true capacity ceiling.
+After three independent DAG search implementations and two token-level revise experiments all returned **0 rescue**, the A axis produced three positive signals at coarse granularities: A4 block-layout rerank (5/60 = 8.33%), A5 prompt-template rerank (8/60 = 13.33%), and **A6 gen-length rerank (12/60 = 20.00%, strongest single A-axis knob)**. H3 pass@N re-run on the full n=60 fail set gave **52/60 = 86.67%**, the strongest single-dimension lever (near-orthogonal to A axis). Full-method union **55/60 = 91.67%**; true capacity ceiling **5 prompts [4,5,14,41,42]**.
 
 | Experiment | Knob | Unit of intervention | Verdict | Rescue |
 |---|---|---|---|---|
@@ -25,7 +25,7 @@ After three independent DAG search implementations and two token-level revise ex
 | **A6 · gen length** | **generation budget** | **total length (64–256 tok)** | **SUPPORTED** | **12/60 (20.00%)** |
 | A4×A5 joint 6-cell | layout × template | 6-cell ensemble | — | 10/60 (16.67%), overlap prediction perfectly validated |
 | H2 · order vs content | variance ratio | block_length ∈ {16,32,64} | REJECTED by stated threshold; foreshadows A4 | ratio 0.754 |
-| **H3 · pass@N** | **sampling diversity** | **—** | **SUPPORTED** | **7/30 (23.33%)** |
+| **H3 · pass@N (n=60)** | **sampling diversity** | **—** | **REJECTED** (per capacity-ceiling threshold) | **52/60 (86.67%)** |
 
 The key inversion: H2 was actually a block_length sweep (`block_length ∈ {16, 32, 64}` at T=0, not three different schedulers as originally framed) and REJECTED the claim "order carries < 30% of content's signal" (ratio 0.754 >> 0.3) — i.e. block-layout order already carried 75% of the output variance of temperature. A1's triple-0-rescue at the edge level says nothing about this. A4 is the direct next step: take H2's same knob (block_length) and ask not "does it change the output" but "does it change *correctness*". Answer: yes, for 8.33% of fail prompts.
 
@@ -81,26 +81,36 @@ Every downstream A-axis experiment uses `scope_fail_prompts.json` so results are
 
 ---
 
-## H3 — pass@N capacity ceiling · SUPPORTED (final result)
+## H3 — pass@N capacity ceiling · Strongest single-dimension lever (n=60 authoritative)
 
 **Claim**: these 137 prompts are at LLaDA-instruct's capability ceiling — even temperature + N samples can't rescue them.
 
 **Design**:
 - `scripts/validate/h3_passN_at_temperature.py`
-- K=30 fail prompts + K=30 init_ok prompts (control).
+- Full n_fail + n_ok control.
 - Per prompt × T ∈ {0.3, 0.7, 1.0} × N=8 samples → compute pass@1 / pass@4 / pass@8.
 - Verdicts: `fail_p@8 < 5% AND ok_p@8 > 90%` → SUPPORTED (capacity ceiling); `fail_p@8 > 20%` → REJECTED.
 
-**Final result (N=30 fail)**: 7/30 rescue (idx=0,2,8,13,15,24,28), rescue_rate=**23.33%** → **SUPPORTED** (overturns earlier "likely INCONCLUSIVE" prediction). 4 prompts stuck (pass@8=0 at all temps).
+**Initial (n=30 fail, 2026-04-15)**: 7 prompts rescued (idx=0,2,8,13,15,24,28), rescue_rate=23.33%, 4 stuck. Small-sample cross-analysis: H3-only {2, 24}, H3 ∩ A6-only {0}, H3 ∩ (A4∪A5) {8, 13, 15, 28}.
 
-**Note**: `p5_h3_crossref.py` outputs h3_rescue=0 due to a **BUG** (H3 uses `fail_XXXX.json` naming, not `XXXX.json`). True H3 rescue=7; cross-analysis was done manually.
+**n=60 rerun (`h3_passN_20260415_133254`, 2026-04-16)**: extended to full 60 fail + 30 ok control.
+- `fail_pass@8_max = 86.67%` (T=1.0) / `ok_pass@8_max = 100%` → **REJECTED per threshold** (= capacity ceiling does not hold).
+- P6 crossref (`p6_h3_crossref.py`) output: H3 rescue = **52/60 (86.67%)**, H3 stuck = **8 prompts [4, 5, 14, 19, 41, 42, 48, 51]**.
 
-**Interpretation**: H3 SUPPORTED (fail_p@8 > 20%) means the capacity ceiling hypothesis is **REJECTED** — the model is not fundamentally incapable, but rather fails under default configuration. Diversity sampling (23.33%) is a valid lever, though cheaper A-axis knobs (A6=20%) achieve comparable results.
+**n=60 rescue-set cross-analysis (P6 authoritative)**:
+- A-union (A4∪A5∪A6) = 13/60 (21.67%).
+- H3 ∩ FAIL18 (the 18-prompt subset where bl32/baseline/g128 baselines all fail) = 10 prompts {0, 8, 10, 13, 15, 28, 35, 53, 55, 59} — **all covered by A-union; H3 contributes 0 unique rescue inside FAIL18.**
+- H3's 42 "only"-rescues all live outside FAIL18 (= A-axis baselines already correct, but there are also correct completions at T>0).
+- A6-only rescues {19, 51} stay stuck under H3 too (confirms "write-space > diversity").
+- idx=48 forms a new category: "rescued by A5+A6+Joint, stuck under H3" — A axis rescues, pass@N cannot.
 
-**H3 rescue set cross-analysis**:
-- H3-only: {2, 24} — only rescuable by diversity sampling, not covered by A-axis knobs
-- H3 ∩ A6-only: {0} — only rescuable by H3 and A6
-- H3 ∩ A4∪A5: {8, 13, 15, 28} — also covered by A-axis knobs
+**Interpretation**:
+1. The initial n=30 "23.33%" was a **small-sample artifact**; on the full 60 prompts pass@N rescue is 86.67% and **dominates** the entire A axis rather than being comparable.
+2. On the strict "rescue a baseline-wrong prompt" question, H3 still contributes **0 unique rescues** (10/10 swallowed by A-union in FAIL18). H3's value lies in pass@8 stably flipping many baseline-correct prompts under T=0.3 — which conversely also covers many baseline-wrong ones.
+3. The write-space signal (A6-only {19, 51}) remains uncovered by H3, proving the A-axis rescue is systematic, not lucky sampling.
+4. True capacity ceiling is fixed at 5 prompts [4, 5, 14, 41, 42].
+
+**Historical bug**: `p5_h3_crossref.py` was written for the old H3 schema (`pass_at_k` dict) and silently outputs h3_rescue=0 under the current `fail_XXXX.json + temps.T.pass@k` shape. **Fixed by `p6_h3_crossref.py`**.
 
 ---
 
@@ -295,11 +305,11 @@ Validates that the overlap analysis methodology is reliable and no unexpected cr
 | 1 prompt | A5 | change template | **SIGNAL** (13.33%) |
 | gen_length | A6 | change generation length | **SIGNAL** (20.00%, strongest) |
 | layout x template | A4xA5 joint | 6-cell ensemble | 16.67% (overlap perfectly validated) |
-| sampling scheme | H2, H3 | H2 varies `block_length`; H3 varies T + N | H3 **SUPPORTED** (23.33%) |
+| sampling scheme | H2, H3 | H2 varies `block_length`; H3 varies T + N | H3 (n=60) **86.67% dominates A axis** |
 
-The signal first appears at the **block level** and grows at the prompt/gen_length level. Everything finer (token, span, edge) is dead. A6 gen_length is the strongest single-axis signal (20%); g160 alone nearly matches A5's any-template ensemble.
+The signal first appears at the **block level** and grows at the prompt/gen_length level. Everything finer (token, span, edge) is dead. A6 gen_length is the strongest single-axis signal within A (20%); g160 alone nearly matches A5's any-template ensemble. H3 (pass@N multi-T) is the **strongest cross-axis lever** at 52/60 = 86.67%, but it is near-orthogonal to the A axis (H3 ⊆ A-union is only 19.2%).
 
-**Full-method union = 15/18 = 83.3%**. Only 3 prompts (idx=5,6,16) are unsalvageable by any method = true capacity ceiling. Axes are mostly orthogonal: A6-only {19,51}, H3-only {2,24}.
+**Full-method union = 55/60 = 91.67%** (n=60 authoritative). Only 5 prompts [4,5,14,41,42] are unsalvageable by any method = true capacity ceiling. In the FAIL18 subset view: A-union = H3-union = 13/18 = 72.2%, H3 contributes 0 unique rescues inside FAIL18; A6-only rescues {19, 51} remain stuck even under H3.
 
 **The rescue signal scales with granularity**: A4's 8.33% -> A5's 13.33% -> A6's 20.00% are monotone in intervention coarseness. This is evidence that **the LLaDA-instruct model doesn't have a fixable "ordering mistake" per se** — there's no small local fix. What works is a different global denoise trajectory (A4), a different input framing (A5), or a different generation budget (A6) — all of which redistribute the *entire* output, not just a localized token.
 
@@ -325,11 +335,17 @@ H2 REJECTED (0.754) ────┤
 A5 SUPPORTED (8/60) ────┤──> block-layout + prompt-template + gen-length all carry signal
 A6 SUPPORTED (12/60) ───┘     → A6 strongest (20%), g160 is the sweet spot
                               → A4xA5 joint 6-cell perfectly validated (10=10)
-                              → full-method union 15/18 = 83.3%
+                              → A-union = 13/60 = 21.67% (n=60)
+                              → full-method union = 55/60 = 91.67% (n=60)
+                              → FAIL18 subset: A-union = H3-union = 13/18 = 72.2%
 
-H3 SUPPORTED (7/30 = 23.33%)
-  → capacity ceiling REJECTED (model is capable, just misconfigured)
-  → H3-only {2,24}: diversity sampling has independent signal beyond A-axis
+H3 (n=60) pass@8 = 86.67% (52/60)  ← REJECTED per capacity-ceiling threshold
+  → capacity ceiling REJECTED (model is far from its ceiling)
+  → H3-only 42 prompts all live outside FAIL18; 0 unique rescues inside FAIL18
+  → H3 ⊆ A-union (full set) = 19.2%, near-orthogonal to A axis
+  → A6-only {19, 51} stay stuck under H3 too → "write-space > diversity"
+
+True capacity ceiling = 5 prompts [4, 5, 14, 41, 42]  (consistent across n=60 and FAIL18 views)
 
 → next: per-prompt strategy search (block_length x template x gen_length x temperature)
 → new dimension: template_position (diffusion-LM-specific scaffold/inpainting)
@@ -341,15 +357,15 @@ H3 SUPPORTED (7/30 = 23.33%)
 
 **Resolved**:
 1. ~~A4 x A5 overlap~~ → **DONE**: independence=0.769, joint 6-cell run perfectly validated (10=10)
-2. ~~H3 completion~~ → **DONE**: SUPPORTED, 7/30=23.33%. H3-only: {2, 24}
+2. ~~H3 completion~~ → **DONE (n=60 authoritative)**: pass@8 = 86.67% (52/60), REJECTED per capacity-ceiling threshold; H3 ⊆ A-union only 19.2% (near-orthogonal), FAIL18 ∩ H3 = 10 prompts {0,8,10,13,15,28,35,53,55,59} all covered by A-union, 0 unique rescues inside FAIL18
 3. ~~Can we ship `answer` alone~~ → **NO** (overlap analysis confirmed)
 4. ~~gen_length expansion~~ → **DONE → A6 SUPPORTED**, rescue=20%
+5. ~~p5_h3_crossref.py BUG~~ → **DONE**: `p6_h3_crossref.py` created to fix the schema mismatch (old `pass_at_k` dict vs current `temps.T.pass@k` silently outputting h3_rescue=0). P6 is the n=60 authoritative crossref, outputs full_union=55/60 (91.67%), ceiling=5 [4,5,14,41,42], h3_only=42, a6_only=[19,51]
 
 **Open**:
 1. **Per-prompt strategy search**: search optimal `(block_length x template x gen_length x temperature)` per prompt → `(prompt, best_strategy)` pairs. This is the next-phase mainline.
 2. **template_position new dimension**: diffusion-LM-specific scaffold/inpainting — place template tokens at arbitrary positions within generation region. Unique to diffusion LMs.
 3. **P4/P6 offline analysis**: CoT-broken pattern + A4-only rescue features. At N=60 all 7 features are non-significant (see `finding_p4_p6_feature_analysis.zh.md`); defer to N=137.
-4. **p5_h3_crossref.py BUG**: H3 uses `fail_XXXX.json` naming causing script mismatch. Cross-analysis was done manually, but script needs fixing.
 
 ---
 
@@ -366,6 +382,7 @@ H3 SUPPORTED (7/30 = 23.33%)
 - `scripts/validate/_http_client.py` — shared FastAPI client
 - `scripts/validate/aggregate_verdicts.py` — idempotent verdict-board rewriter
 - `scripts/validate/run_a_axis.sh` — sequential A3→A4→A5 runner
+- `scripts/validate/p6_h3_crossref.py` — H3 × A-axis n=60 crossref (replaces buggy P5)
 - `scripts/serve.py` — added `/generate_span_revise`, `/generate_block_schedule`
 
 ### Server-side samplers
