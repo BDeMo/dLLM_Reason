@@ -463,6 +463,20 @@ def main():
     ap.add_argument("--full_space", action="store_true",
                     help="use full grid {bl=8,16,32,64}×{gen=64..256}×{T=0,0.3,0.7,1.0} "
                          "(ignores pruned defaults; ~5 days at 1.5s/call)")
+    # Multi-GPU sharding (Scheme A: shared run_dir, slice prompts per GPU) ──────
+    ap.add_argument("--prompt_start", type=int, default=None,
+                    help="shard slice start (inclusive) into the loaded prompts "
+                         "list after --groups/--n. Use with --prompt_end to run a "
+                         "subset of prompts per GPU. Sharding is SAFE: each prompt "
+                         "is scored independently, per_prompt/{group}_{idx}.json "
+                         "files don't collide.")
+    ap.add_argument("--prompt_end", type=int, default=None,
+                    help="shard slice end (exclusive); defaults to len(prompts).")
+    ap.add_argument("--skip_summary", action="store_true",
+                    help="skip winners.json + summary.json aggregation at end. "
+                         "REQUIRED for shard workers to avoid race-writing the "
+                         "shared summary files. Run a final no-slice --resume "
+                         "pass without this flag to build the global summary.")
     add_common_args(ap)
     add_server_arg(ap)
     args = ap.parse_args()
@@ -483,10 +497,21 @@ def main():
         return
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    prompts = load_prompts(groups, args.n)
-    if not prompts:
+    prompts_full = load_prompts(groups, args.n)
+    if not prompts_full:
         print("[SS] no prompts loaded; check --groups / --n")
         return
+
+    # Apply shard slice to the WORK list (todo). Summary at the end always
+    # aggregates from the FULL list so shard workers + final pass agree.
+    if args.prompt_start is not None or args.prompt_end is not None:
+        s = args.prompt_start if args.prompt_start is not None else 0
+        e = args.prompt_end if args.prompt_end is not None else len(prompts_full)
+        prompts = prompts_full[s:e]
+        print(f"[SS] shard slice: prompts[{s}:{e}] → {len(prompts)} prompts "
+              f"(of {len(prompts_full)} total)")
+    else:
+        prompts = prompts_full
 
     total_calls = sum(c.num_samples for c in configs) * len(prompts)
     est_hours_15 = total_calls * 1.5 / 3600
@@ -607,12 +632,27 @@ def main():
         os.replace(tmp, path)
         pp.tick(f"{key}  {n_correct_cfg}/{len(configs)} configs passed")
 
-    # Summary: oracle rate, multi-winner per prompt
+    # Summary aggregation — use FULL prompts list so shard workers + final
+    # aggregate pass agree on scope. Shard workers should pass --skip_summary
+    # to avoid racing on winners.json / summary.json writes.
+    if args.skip_summary:
+        print()
+        print(f"[SS] --skip_summary set; shard done, skipping aggregate. "
+              f"Run a final `--resume` pass without --prompt_start/--prompt_end "
+              f"and without --skip_summary to build global summary.")
+        return
+
     all_recs = []
-    for group, i, rec in prompts:
+    missing = 0
+    for group, i, rec in prompts_full:
         p = rd.per_prompt / f"{prompt_key(group, i)}.json"
         if p.exists():
             all_recs.append(json.loads(p.read_text(encoding="utf-8")))
+        else:
+            missing += 1
+    if missing:
+        print(f"[SS] WARN: {missing}/{len(prompts_full)} per_prompt files missing; "
+              f"summary will be partial.")
 
     oracle_correct = sum(1 for r in all_recs if r["n_configs_passed"] > 0)
     winners = [_pick_winners(r) for r in all_recs]
