@@ -97,7 +97,9 @@ active ─┬─> done                    # 按计划完成
 
 ## 当前 active plan
 
-**👉 [`2026-04-19_replan_next_phase.zh.md`](2026-04-19_replan_next_phase.zh.md)**
+**👉 [`2026-04-19_replan_next_phase.zh.md`](2026-04-19_replan_next_phase.zh.md)** —— 最新决策
+
+**👉 [`PROJECT_OVERVIEW.zh.md`](PROJECT_OVERVIEW.zh.md)** —— top-level 项目总览（常驻，不带日期）
 
 ---
 
