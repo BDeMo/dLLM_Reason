@@ -86,6 +86,7 @@ active ─┬─> done                    # 按计划完成
 
 | 日期 | 文件 | 状态 | 摘要 |
 |---|---|---|---|
+| 2026-04-19 | [`2026-04-19_related_work_review.zh.md`](2026-04-19_related_work_review.zh.md) | active | 15 篇精读：LogicDiff / DAWN / Where-to-Unmask / ReasonFlux / ... + paper positioning |
 | 2026-04-19 | [`2026-04-19_replan_next_phase.zh.md`](2026-04-19_replan_next_phase.zh.md) | **active** ⭐ | 当前 active。SS 搁浅后重新规划 |
 | 2026-04-19 | [`2026-04-19_ss_run_postmortem.zh.md`](2026-04-19_ss_run_postmortem.zh.md) | done | SS 跑 3 天 13.8% 完成度，慢 11× 未定因。止损 |
 | 2026-04-16 | [`2026-04-16_paper_framing.zh.md`](2026-04-16_paper_framing.zh.md) | active | Paper 定位 "canvas-constrained reasoning" |
