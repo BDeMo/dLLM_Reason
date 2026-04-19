@@ -15,6 +15,24 @@
 
 `archive/` 是"**论文附录**"，`plans/` 是"**研究日志**"。每当有人（包括未来的自己）问"为什么当初这么做"，答案在 `plans/`。
 
+## Public (`plans/`) vs Private (`../private/`) 分类规则
+
+| 放 public `docs/plans/` | 放 private `docs/private/`（gitignored）|
+|---|---|
+| **done** —— 已完成阶段的 retrospective | 要做 / 未来 plan / 未定方向的 brainstorm |
+| **in progress / active** —— 正在执行的 plan | 对他人工作的 critical commentary（措辞较直接） |
+| **superseded** —— 做过但被取代的历史 plan | 不想公开的 personal notes / draft |
+| 可出现在 paper / 可被审稿人看到的内容 | 跑完后实验结果可能翻盘的过程推断 |
+
+**Rule of thumb**：
+- 已经发生或正在发生的事实 → public
+- "打算做什么" / "对别人的质疑" / "未来 plan 骨架" → private
+
+新建 plan 文件时先想一下当前状态：
+- 要动手做了 → public，开 `YYYY-MM-DD_topic.zh.md` in `plans/`
+- 只是 brainstorm 或 critical note → private，开 in `private/`
+- 如果 private plan 后来决定执行 → 迁移到 public plans/（mv 命令），状态置为 active
+
 ---
 
 ## 维护规则

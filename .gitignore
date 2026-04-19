@@ -35,3 +35,7 @@ wandb/
 test*.ipynb
 paper/
 docs/dLLM_Reason.pdf
+
+# Private notes — brainstorms, critical postmortems, anything not meant for
+# public repo. Local-only. Anything under docs/private/ is never pushed.
+docs/private/
