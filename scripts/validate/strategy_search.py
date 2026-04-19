@@ -432,18 +432,85 @@ def parse_dims_filter(dims_arg: str) -> list[str]:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def load_prompts(groups: list[str], n: int) -> list[tuple[int, str, dict]]:
-    """Return (group, original_idx, rec) tuples. Group is 'fail' or 'ok'."""
+# Well-known named index sets (kept here to avoid scattering the definition).
+# Source: docs/archive/ablation_index.zh.md, n=60 P6-authoritative.
+FAIL18 = [0, 4, 5, 8, 10, 13, 14, 15, 19, 28, 35, 41, 42, 48, 51, 53, 55, 59]
+CEILING5 = [4, 5, 14, 41, 42]
+
+NAMED_INDEX_SETS = {
+    "fail18": ("fail", FAIL18),
+    "ceiling5": ("fail", CEILING5),
+}
+
+
+def load_prompts(
+    groups: list[str], n: int,
+    fail_indices: list[int] | None = None,
+    ok_indices: list[int] | None = None,
+) -> list[tuple[int, str, dict]]:
+    """Return (group, original_idx, rec) tuples. Group is 'fail' or 'ok'.
+
+    If ``fail_indices`` / ``ok_indices`` is given (non-None), select only those
+    exact indices from the corresponding scope file (ignoring ``n`` for that
+    group). Otherwise take top-N as before.
+    """
     out = []
     if "fail" in groups:
-        fails = json.loads(SCOPE_FAIL.read_text(encoding="utf-8"))[:n]
-        for i, r in enumerate(fails):
-            out.append(("fail", i, r))
+        all_fails = json.loads(SCOPE_FAIL.read_text(encoding="utf-8"))
+        if fail_indices is not None:
+            for i in fail_indices:
+                if i >= len(all_fails):
+                    raise IndexError(f"fail index {i} out of range (have {len(all_fails)})")
+                out.append(("fail", i, all_fails[i]))
+        else:
+            for i, r in enumerate(all_fails[:n]):
+                out.append(("fail", i, r))
     if "ok" in groups:
-        oks = json.loads(SCOPE_OK.read_text(encoding="utf-8"))[:n]
-        for i, r in enumerate(oks):
-            out.append(("ok", i, r))
+        all_oks = json.loads(SCOPE_OK.read_text(encoding="utf-8"))
+        if ok_indices is not None:
+            for i in ok_indices:
+                if i >= len(all_oks):
+                    raise IndexError(f"ok index {i} out of range (have {len(all_oks)})")
+                out.append(("ok", i, all_oks[i]))
+        else:
+            for i, r in enumerate(all_oks[:n]):
+                out.append(("ok", i, r))
     return out
+
+
+def _parse_index_spec(spec: str | None) -> tuple[list[int] | None, list[int] | None]:
+    """Parse a --prompt_indices spec.
+
+    Accepts:
+      - 'fail18', 'ceiling5' (named sets; single group)
+      - 'fail:0,4,5' / 'ok:2,3' / 'fail:0,4;ok:2' (explicit group:indices)
+    Returns (fail_indices, ok_indices). Either can be None (= use --n fallback).
+    """
+    if spec is None:
+        return None, None
+    spec = spec.strip()
+    if spec in NAMED_INDEX_SETS:
+        grp, idxs = NAMED_INDEX_SETS[spec]
+        return (idxs, None) if grp == "fail" else (None, idxs)
+    # Explicit 'fail:0,4;ok:2' form
+    fail_idx, ok_idx = None, None
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"--prompt_indices expects 'group:idx,idx' or named set, got {part!r}"
+            )
+        g, idxs = part.split(":", 1)
+        ilist = [int(x) for x in idxs.split(",") if x.strip()]
+        if g == "fail":
+            fail_idx = ilist
+        elif g == "ok":
+            ok_idx = ilist
+        else:
+            raise ValueError(f"unknown group {g!r} in --prompt_indices")
+    return fail_idx, ok_idx
 
 
 def main():
@@ -463,6 +530,12 @@ def main():
     ap.add_argument("--full_space", action="store_true",
                     help="use full grid {bl=8,16,32,64}×{gen=64..256}×{T=0,0.3,0.7,1.0} "
                          "(ignores pruned defaults; ~5 days at 1.5s/call)")
+    ap.add_argument("--prompt_indices", type=str, default=None,
+                    help="Select exact prompt indices instead of top-N. Accepts: "
+                         "'fail18' / 'ceiling5' (named sets), or explicit "
+                         "'fail:0,4,5' / 'ok:2,3' / 'fail:0,4;ok:2'. Overrides --n "
+                         "for the named groups. Useful for targeted re-runs on "
+                         "FAIL18 (see docs/archive/ablation_index.zh.md).")
     # Multi-GPU sharding (Scheme A: shared run_dir, slice prompts per GPU) ──────
     ap.add_argument("--prompt_start", type=int, default=None,
                     help="shard slice start (inclusive) into the loaded prompts "
@@ -497,9 +570,14 @@ def main():
         return
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    prompts_full = load_prompts(groups, args.n)
+    fail_idx, ok_idx = _parse_index_spec(args.prompt_indices)
+    if args.prompt_indices is not None:
+        print(f"[SS] --prompt_indices={args.prompt_indices!r}: "
+              f"fail={fail_idx}  ok={ok_idx}")
+    prompts_full = load_prompts(groups, args.n,
+                                fail_indices=fail_idx, ok_indices=ok_idx)
     if not prompts_full:
-        print("[SS] no prompts loaded; check --groups / --n")
+        print("[SS] no prompts loaded; check --groups / --n / --prompt_indices")
         return
 
     # Apply shard slice to the WORK list (todo). Summary at the end always
