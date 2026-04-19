@@ -78,30 +78,29 @@
 
 **Experimental setup**: 256 denoising steps, 256 max new tokens, frozen LLaDA, <6% speed overhead
 
-**Stated limitations**:
-- "Role head trained on GSM8K only"
-- "Five roles are coarse"
-- "Evaluated only on LLaDA-8B"
-- "Consistency checker failed" —— 他们尝试加个 remasking consistency 机制，accuracy 反而 64% → 3%
+**Scope notes (as stated by authors)**:
+- Role classifier trained on GSM8K-specific data; authors note broader taxonomies would extend coverage
+- Five-role taxonomy characterized as "coarse" in the paper; authors position it as an initial formulation
+- Evaluation focused on LLaDA-8B; extension to other diffusion LMs is noted as future work
+- A consistency checker variant explored in the paper; authors report it reduced accuracy (reported as 64% → 3%) and is not part of the final method
 
-**Baseline comparison they made**:
-- DOS (prior attention-based): "attention matrices as statistical proxies" —— LogicDiff 用 explicit classifier 打赢
-- d1 (84.5%, RL-trained): complementary to LogicDiff
-- JustGRPO (89.1%, RL-trained)
+**Baselines they compare against**:
+- DOS: attention-matrix-based ordering (prior work on structural unmasking)
+- d1 (84.5%), JustGRPO (89.1%): RL-trained methods. Authors note LogicDiff is complementary to RL approaches — their sampler can apply on top of RL-trained models
 
-**跟我们的关系 —— 正交的两个轴**：
+**跟我们的关系 —— 不同 axis，可组合**：
 
-| 轴 | LogicDiff | Inpainting (我们) |
+| 维度 | LogicDiff | Inpainting (我们) |
 |---|---|---|
-| 改什么 | unmask 顺序 | canvas 哪些位置 pre-committed |
-| 粒度 | token-级 semantic bucket (5 类) | canvas-级 spatial structure |
-| 训练 | 要训 4.2M classifier | training-free |
-| Axis | Temporal (顺序) | Spatial (空间) |
+| 干预对象 | Unmask 顺序 (temporal) | Canvas 位置 pre-commit (spatial) |
+| 粒度 | Token 级，5 semantic role 分类 | Canvas 级结构 |
+| Setup | 需预训 4.2M 小 classifier | Inference-time structural pre-commit |
+| Prompt 设置 | 0-shot per paper | 0-shot（我们 setup）|
 
 **Paper 可以利用**：
-- LogicDiff 是我们最强的 comparator，必 cite + compare
-- 声称两个 axis 正交（理论上可组合）
-- 我们 training-free + 泛化好（不用为每个 task 重训 classifier）
+- LogicDiff 是最近最相关的 diffusion-LM reasoning 工作，必 cite + 讨论
+- 两种 intervention 作用在**不同 axis**，原理上可叠加（测试是 good future work）
+- 我们的方法不需 task-specific fine-tune，与 LogicDiff 形成 methodological 互补
 
 **BibTeX (draft)**:
 ```
@@ -165,18 +164,18 @@
 - Learned planner: 0.705
 - Heuristic Margin (baseline): 0.605
 
-**Not training-free** —— 要 LoRA on 每个 dataset。
+**Setup**: Per-dataset LoRA fine-tuning of the planner on oracle orders.
 
-**Benchmarks**: GSM8K, MATH, Sudoku 9×9, StrategyQA. Models: LLaDA-8B + Dream-7B.
+**Benchmarks**: GSM8K, MATH, Sudoku 9×9, StrategyQA. Models: LLaDA-8B, Dream-7B.
 
 **跟我们的关系**:
-- 正交 axis (temporal learned policy)
-- **Oracle 0.845 是 diffusion LM 的 unmask-order 上限参考**
-- 如果结合 canvas constraint + 他们的 oracle → 理论可能 > 0.845
+- 不同 axis（temporal ordering via learned supervised planner）
+- 他们的 **0.845 Gt-Margin oracle** 是 diffusion LM temporal unmasking 的有参考价值的 upper bound
+- Canvas-constraint 是 orthogonal axis，理论可与 temporal ordering 组合
 
 **Paper 可以利用**：
-- 0.845 oracle 作为"structure-only upper bound"
-- 我们 training-free，他们需 LoRA
+- 引 0.845 oracle 作为 temporal-axis upper bound
+- 我们的 inference-time structural intervention 和他们的 distilled planner 形成 methodological 对照（structural vs learned）
 
 ---
 
@@ -194,11 +193,11 @@
 **Numbers**: 具体 benchmark 数字 abstract 未给。
 "Match SOTA heuristics when combined with semi-AR (block) generation, outperform in full-diffusion setting."
 
-**Training required**, not training-free.
+**Setup**: RL-trained policy.
 
 **跟我们的关系**：
-- 同 temporal-axis 路线（学 unmask decision）
-- 我们还是正交到 spatial axis
+- 同 temporal-axis family（学 unmask decision）
+- Canvas-constraint 作用在 orthogonal axis (spatial)，与 RL-learned temporal policy 互补
 
 ---
 
@@ -238,12 +237,12 @@
 - **AR LM** (Qwen2.5-32B-Instruct 家族)
 
 **跟我们的关系**：
-- AR LM → 不同架构
-- "Templates" 类似我们的 `template_name` dimension，但他们是 500 条，我们 5 条
-- 他们是 retrieval + AR instantiate，我们是 prompt-level ensemble
+- AR LM 架构，与 diffusion LM 路径不同
+- 他们的 "templates" 是高层 problem-solving strategy（500 条 curated library），作用在 prompting + navigator；我们的 `template_name` 是 5 种 CoT-style suffix，作用在 canvas 的不同 position
+- 同属"结构化推理"大方向的不同实现
 
 **Paper 可以利用**：
-- 背景 citation "template-guided reasoning in AR LMs (ReasonFlux); we study canvas-level templates in diffusion LMs"
+- 背景 citation，说明 template-guided reasoning 在 AR LM 的成功激发了我们在 diffusion 路径上的探索
 
 ---
 
@@ -262,12 +261,11 @@
 - StrategyQA 0.858 (vs 0.760 baseline SFT)
 - GSM8K 0.942, MATH-500 0.928
 
-**AR LM，training-required**.
+**Setup**: Distillation-based training (teacher CoT → student signal-aware model).
 
 **跟我们的关系**：
-- AR LM → 不同架构
-- "7 semantic signals" 概念上类似 LogicDiff 的 "5 roles"，都是**coarse semantic bucket**
-- 验证了"coarse structure is useful" 这个我们的 granularity ladder 论点
+- AR LM 架构
+- 他们的 7 semantic signals 与 LogicDiff 的 5 roles 相似（semantic-bucket 级结构）—— 两者共同支持"coarse semantic structure 对 reasoning 有用" 这一 observation，与我们的 granularity-ladder 发现一致
 
 ---
 
@@ -282,13 +280,13 @@
 - 用 Problem Condition Complexity (PCC) 做 template retrieval
 - Rollout 用 template 引导，RL 学习 validated strategic patterns
 
-**AR LM (Qwen/Llama), training-required**.
+**Setup**: Template-guided RL fine-tuning (training-time).
 
-**Numbers**: Qwen2.5-Math-7B-Base vs GRPO: AIME24 +99.4% (33.3% vs 16.7%), AMC +40.9%
+**Numbers**: 在 Qwen2.5-Math-7B-Base 对比 GRPO 基线：AIME24 33.3% vs 16.7%，AMC 77.5% vs 55.0%
 
 **跟我们的关系**：
-- AR LM → 不同架构
-- "Templates as guidance" 概念类似，但他们 RL-training-time，我们 inference-time
+- AR LM 架构
+- 概念上类似（templates as guidance），但 intervention 时机不同：他们 training-time（RL rollout guidance），我们 inference-time（structural pre-commit）
 
 ---
 
@@ -303,8 +301,8 @@
 **Method**: 3-stage: SFT with weighted chain loss / prompt-time injection via LoRA / curriculum FT via GRPO
 
 **跟我们的关系**：
-- AR LM，training-required
-- "Difficulty scaling law" 对我们 **FAIL18 vs n=60** 的 stratification 思路有启发
+- AR LM 架构
+- 他们关于 "difficulty scaling" 的结论（对 reasoning 难度分布的敏感性）与我们 FAIL18 / n=60 分层思路在 spirit 上一致 —— 可作为对"子集选择"重要性的外部支持
 
 ---
 
@@ -340,12 +338,12 @@
 - CoT 按 "→" 分段 → entity recognition → 连边 → path pooling + scoring
 - Causal graph 引导 **retrieval**，不是 generation
 
-**AR LM (GPT-4o / 4 / 4o-mini)**.
+**Models**: GPT-4o / GPT-4 / GPT-4o-mini (AR LM).
 
 **跟我们的关系**：
-- AR LM + KG retrieval，跟我们不同路径
-- 但"causal structure improves reasoning"的 trend 支持我们 framing
-- Paper 可引作背景："prior work integrates causal graphs at retrieval layer (CGMT); we integrate structural constraints at canvas layer"
+- AR LM + KG retrieval，与我们路径不同
+- 共同支持"structure-in-reasoning helps" 的大方向
+- Paper 可引作背景：prior work integrates structure at retrieval / prompting layers; we contribute structure at the generation-substrate layer in diffusion LMs
 
 ---
 
@@ -406,51 +404,62 @@
 
 ## Paper positioning implications
 
-### 1. 核心 claim 排序（我们 paper 的 uniqueness）
+### 1. 核心 contributions（我们 paper 独立贡献的维度）
 
-1. ⭐⭐⭐ **Canvas-spatial constraint (inpainting as scaffold)** —— 所有 cited work 里**没有**
-2. ⭐⭐ **Systematic granularity sweep**（token/edge/block/prompt/gen/role/position）—— LogicDiff 只 1 种
-3. ⭐⭐ **Training-free** —— LogicDiff / Where-to-Unmask / Learning-Policy 都要训
-4. ⭐ **Write-space > diversity** story (A6-only + H3 stuck)
-5. ⭐ **Capacity ceiling** 定量分析 (5 条)
+1. ⭐⭐⭐ **Canvas-spatial constraints**（inpainting-style scaffolding）—— 当前 diffusion LM reasoning 文献里尚未被独立研究的维度
+2. ⭐⭐ **Systematic granularity sweep** —— 跨 token/edge/block/prompt/gen/position 多粒度对比，是此前 diffusion LM reasoning 工作未覆盖的 breadth
+3. ⭐⭐ **Inference-time structural intervention** —— 与已有 learned/classifier-based / RL-trained 方法形成方法论互补
+4. ⭐ **Write-space vs diversity 现象** (A6-only {19,51} + H3 stuck) —— 观察到的实证信号
+5. ⭐ **Capacity ceiling 定量界定** (5 条 prompt in n=60)
 
 ### 2. Related work 章节骨架
 
 ```
 §2 Related Work
   §2.1 Unmasking-order interventions in diffusion LMs
-    - LogicDiff (semantic role)
-    - DAWN (dependency-aware, speedup-oriented)
-    - Where-to-Unmask (ground-truth oracle + distill)
-    - Learning Unmasking Policies (RL)
-    → all temporal (order); we are orthogonal (spatial canvas)
+    A rich recent line of work addresses the temporal ordering of
+    token unmasking in masked diffusion LMs:
+      - LogicDiff introduces a semantic-role classifier
+      - DAWN extracts dependency structure from attention for speedup
+      - Where-to-Unmask learns a supervised planner from oracle orders
+      - Learning Unmasking Policies trains an RL sampler
+    Our work is complementary: canvas-spatial constraints operate on a
+    different axis and can in principle be combined with any of these.
   
-  §2.2 Template / scaffold-guided reasoning in AR LMs
-    - ReasonFlux (500 thought templates, retrieval)
-    - Reasoning Scaffolding (7 semantic signals, distill)
-    - TemplateRL (templates + GRPO)
-    - Can Structured Templates Facilitate LLMs (XML chains)
-    → all AR; canvas constraint unique to diffusion
+  §2.2 Template- and scaffold-guided reasoning
+    Template-based reasoning has been explored extensively in AR LMs:
+      - ReasonFlux (thought-template retrieval)
+      - Reasoning Scaffolding (semantic-signal distillation)
+      - TemplateRL (template-guided RL)
+      - Can Structured Templates Facilitate LLMs (XML chain SFT)
+    We study structure at the canvas level, which is a generation
+    substrate unique to diffusion LMs.
   
-  §2.3 Constrained decoding (output-space)
-    - Outlines / Guidance / grammar / JSON mode
-    → output-space constraints; we introduce substrate-space
+  §2.3 Constrained decoding
+    Grammar- / schema-constrained decoding (Outlines, Guidance, JSON
+    mode) constrain the output token distribution. Our canvas
+    constraints operate on the generation substrate itself, a distinct
+    (orthogonal) axis.
   
-  §2.4 Causal-graph-guided reasoning
-    - Kiciman (LLMs for causal discovery)
-    - Causal Graphs Meet Thoughts (KG + retrieval)
-    - Survey / CausalGraph2LLM
-    → all AR + prompt-level; we go to generation internals
+  §2.4 Causal and structured reasoning in LLMs
+    Integration of explicit structure into LLM reasoning has been
+    studied primarily for AR LMs:
+      - Kiciman et al. (LLMs for causal discovery)
+      - Causal Graphs Meet Thoughts (KG-guided retrieval)
+      - CausalGraph2LLM (LLM graph-encoding sensitivity)
+      - Structured Thinking Matters (KG via tool-calling)
+    We extend the "structure-in-reasoning" theme to the diffusion
+    substrate.
 
   §2.5 Foundational diffusion LMs
-    - MDLM (Sahoo et al. NeurIPS 2024)
-    - LLaDA
+    Our work builds on the masked diffusion LM formulation
+    (MDLM, Sahoo et al., NeurIPS 2024) and LLaDA.
 ```
 
 ### 3. Critical comparisons to run (paper 实验要求)
 
-1. **LogicDiff as baseline** —— 他们 code 公开的话 reproduce 一下在我们的 eval setup（n=60 fail 口径）
-2. **Orthogonality test** —— 理论上 LogicDiff + 我们 canvas 可以叠加，如果能跑出"组合优于各自单独" → 强 positive result
+1. **Reproduce LogicDiff on our eval setup**（若他们 code 公开）——双向 reproduce，以便 apples-to-apples 比较：在他们 setup 下跑我们的方法，在我们 setup 下跑他们的方法
+2. **Orthogonality verification experiment** —— 理论上 LogicDiff 的 temporal role-ordering 与我们的 canvas spatial pre-commit 作用在不同 axis，**组合是否比各自单独更好**是一个合理的实证问题
 
 ### 4. 数字对照表（paper results 可借鉴的）
 
@@ -464,9 +473,11 @@
 | d1 (RL) | LLaDA-8B | 84.5% | RL |
 | JustGRPO | LLaDA-8B | 89.1% | RL |
 
-**我们口径**：baseline (T=0, bl=32, g=128) → 1319 - 137 = 89.6% 正确. 跟 DAWN / JustGRPO 同级，远高于 LogicDiff 的 baseline 22%。
+**我们口径**：baseline (T=0, bl=32, g=128, 0-shot) → 1319 − 137 = 89.6% 正确。跟 DAWN 的 5-shot / RL-trained 方法处同一 magnitude 段。
 
-**说明**：LogicDiff 和我们用的是不同 baseline setup（prompting / gen_length / num_steps 等都不同）。他们的 +38.7pp 是在他们特定弱 baseline 上的提升。我们直接对比要么 reproduce 他们 setup，要么在我们 setup 跑他们方法。
+**关于 baseline 的说明**：不同 paper 使用不同的 prompting setup（0-shot / few-shot / gen_length / num_steps / 解码超参数），因此同一 model 在同一 benchmark 上可报出差异较大的 baseline 数字。LogicDiff 报告的 22% 是他们特定 setup 下的 baseline；我们的 89.6% 是在不同 setup 下的 baseline。两者 + 3-7 方法不可直接一行表横比。
+
+**公平对比的做法**（paper 会说清楚的）：要么在他们 setup 下 reproduce 我们的方法，要么在我们 setup 下 reproduce 他们的方法，两种 setup 下分别汇报相对 gain（Δ over own baseline）。
 
 ---
 
