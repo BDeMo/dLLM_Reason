@@ -73,8 +73,29 @@ def pick_candidate(candidates: list[dict], pick: str) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def load_prompts(groups: list[str], n: int) -> list[tuple[str, int, dict]]:
+def load_prompts(
+    groups: list[str], n: int,
+    scope_path: str | None = None,
+    scope_group: str = "gsm8k",
+) -> list[tuple[str, int, dict]]:
+    """Load prompts.
+
+    If ``scope_path`` is given, read the whole file as a single group labelled
+    ``scope_group`` (e.g. 'gsm8k' for the full gsm8k train set loader output).
+    This is the 'Full' track in the v1.6 plan.
+
+    Otherwise, read default scope_fail_prompts.json / scope_ok_prompts.json
+    per ``groups`` (e.g. "fail" or "fail,ok"). This is the 'Fast' track.
+    """
     out = []
+    if scope_path:
+        data = json.loads(Path(scope_path).read_text(encoding="utf-8"))
+        if n:
+            data = data[:n]
+        for i, r in enumerate(data):
+            out.append((scope_group, i, r))
+        return out
+
     if "fail" in groups:
         fails = json.loads(SCOPE_FAIL.read_text(encoding="utf-8"))[:n]
         for i, r in enumerate(fails):
@@ -107,6 +128,11 @@ def main():
                          "from correct candidates")
     ap.add_argument("--out_jsonl", type=str, default=None,
                     help="output JSONL path (default: <run_dir>/t7_sft.jsonl)")
+    ap.add_argument("--scope_path", type=str, default=None,
+                    help="override default fail/ok scope files; read single "
+                         "scope from this JSON (e.g. gsm8k_train_prompts.json).")
+    ap.add_argument("--scope_group", type=str, default="gsm8k",
+                    help="group label for --scope_path items (default 'gsm8k')")
     add_common_args(ap)
     add_server_arg(ap)
     args = ap.parse_args()
@@ -116,7 +142,9 @@ def main():
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     temps = [float(t.strip()) for t in args.temperatures.split(",") if t.strip()]
-    prompts = load_prompts(groups, args.n)
+    prompts = load_prompts(groups, args.n,
+                           scope_path=args.scope_path,
+                           scope_group=args.scope_group)
 
     run_dir = resolve_run_dir(args, "t7_selfdistill", OUT_BASE)
     rd = RunDir(

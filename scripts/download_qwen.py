@@ -40,26 +40,57 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CKPT_ROOT = ROOT / "checkpoints"
 
-
-# ── Candidate model IDs (Qwen3 family) ───────────────────────────────────────
-# Pinned to concrete HuggingFace repo names as of 2026-04. Adjust if the
-# upstream repos are renamed.
-CANDIDATES = {
-    # size_label : hf_repo_id
-    "4B":   "Qwen/Qwen3-4B",
-    "8B":   "Qwen/Qwen3-8B",
-    "14B":  "Qwen/Qwen3-14B",
-    "30B":  "Qwen/Qwen3-30B-A3B",    # MoE, ~3B activated params
-    "32B":  "Qwen/Qwen3-32B",
-    # Qwen2.5 family (fallback if Qwen3 not available)
-    "q25-7B":  "Qwen/Qwen2.5-7B-Instruct",
-    "q25-32B": "Qwen/Qwen2.5-32B-Instruct",
-    "q25-72B": "Qwen/Qwen2.5-72B-Instruct",
+# ── HF mirror support ────────────────────────────────────────────────────────
+MIRRORS = {
+    "default": "https://huggingface.co",           # official
+    "hf-mirror": "https://hf-mirror.com",           # community mirror (China)
+    "modelscope": "https://www.modelscope.cn",      # ModelScope gateway (caveat:
+                                                    # not drop-in, model IDs differ)
 }
 
-# Default download set — matches v1.6 plan's T6 teacher candidates + a small
-# model for quick sanity checks.
-DEFAULT_SIZES = ["4B", "8B", "32B"]
+
+def apply_mirror(mirror: str | None) -> str:
+    """Set HF_ENDPOINT env var so huggingface_hub + datasets routes via mirror.
+
+    Called BEFORE any `import huggingface_hub` / `from datasets import ...`
+    in the current process; env var is the canonical toggle.
+    """
+    if not mirror or mirror == "default":
+        return MIRRORS["default"]
+    endpoint = MIRRORS.get(mirror, mirror)  # also accept raw URL
+    if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+        print(f"[MIRROR] ERROR: invalid mirror {mirror!r}. Use 'default', "
+              f"'hf-mirror', 'modelscope', or a full URL.", file=sys.stderr)
+        sys.exit(1)
+    os.environ["HF_ENDPOINT"] = endpoint
+    print(f"[MIRROR] HF_ENDPOINT = {endpoint}")
+    return endpoint
+
+
+# ── Candidate model IDs ──────────────────────────────────────────────────────
+# Pinned to concrete HuggingFace repo names. If a repo is renamed upstream,
+# override with --models <Qwen/...> explicitly. Many repos have *-Instruct
+# and *-Base variants; the Instruct variant is usually what we want for T6
+# teacher (follows the <SETUP>/<STEP_x>/<ANSWER> format instruction).
+CANDIDATES = {
+    # Qwen3.5 family (target of v1.6 T6 teacher)
+    "3.5-4B":    "Qwen/Qwen3.5-4B-Instruct",
+    "3.5-9B":    "Qwen/Qwen3.5-9B-Instruct",
+    "3.5-27B":   "Qwen/Qwen3.5-27B-Instruct",
+    # Qwen3 family (likely fallback if Qwen3.5 repos not yet up)
+    "3-4B":      "Qwen/Qwen3-4B",
+    "3-8B":      "Qwen/Qwen3-8B",
+    "3-14B":     "Qwen/Qwen3-14B",
+    "3-30B":     "Qwen/Qwen3-30B-A3B",
+    "3-32B":     "Qwen/Qwen3-32B",
+    # Qwen2.5 family (further fallback)
+    "2.5-7B":    "Qwen/Qwen2.5-7B-Instruct",
+    "2.5-32B":   "Qwen/Qwen2.5-32B-Instruct",
+    "2.5-72B":   "Qwen/Qwen2.5-72B-Instruct",
+}
+
+# Default download set — matches user request 4B/9B/27B in Qwen3.5 family.
+DEFAULT_SIZES = ["3.5-4B", "3.5-9B", "3.5-27B"]
 
 
 def local_dir_for(repo_id: str) -> Path:
@@ -93,6 +124,54 @@ def download_one(repo_id: str, local_dir: Path, dry_run: bool = False,
     print(f"[DL] done: {local_dir}")
 
 
+# ── Post-download file integrity check ───────────────────────────────────────
+
+REQUIRED_PATTERNS = [
+    "config.json",
+    "tokenizer.json",           # most modern tokenizers
+]
+OPTIONAL_BUT_EXPECTED = [
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+]
+
+
+def check_downloaded(local_dir: Path, min_weights_gb: float = 1.0) -> tuple[bool, list[str]]:
+    """Verify a snapshot_download target: required files present, at least
+    one non-empty weight file, total weight size >= min_weights_gb.
+
+    Returns (ok, issues) — `issues` is a list of human-readable problems.
+    """
+    issues: list[str] = []
+    if not local_dir.exists():
+        return False, [f"directory does not exist: {local_dir}"]
+
+    # required files
+    for patt in REQUIRED_PATTERNS:
+        matches = list(local_dir.glob(patt))
+        if not matches:
+            issues.append(f"missing: {patt}")
+        elif any(m.stat().st_size == 0 for m in matches):
+            issues.append(f"zero-size: {patt}")
+
+    # weight files (safetensors or pytorch bin)
+    weight_files = (list(local_dir.glob("*.safetensors"))
+                    + list(local_dir.glob("*.bin")))
+    if not weight_files:
+        issues.append("no *.safetensors or *.bin weight files")
+    else:
+        total_bytes = sum(f.stat().st_size for f in weight_files)
+        total_gb = total_bytes / 1e9
+        if total_gb < min_weights_gb:
+            issues.append(
+                f"weight size too small: {total_gb:.2f} GB "
+                f"(expected >= {min_weights_gb:.1f} GB)"
+            )
+
+    return (len(issues) == 0), issues
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", type=str, default=",".join(DEFAULT_SIZES),
@@ -102,6 +181,11 @@ def main():
     ap.add_argument("--models", type=str, default=None,
                     help="explicit HF repo id(s), comma-separated. "
                          "Overrides --sizes.")
+    ap.add_argument("--mirror", type=str, default=None,
+                    help="HF endpoint override. Options: 'default' (huggingface.co), "
+                         "'hf-mirror' (hf-mirror.com, China), 'modelscope' "
+                         "(modelscope.cn — note: model IDs differ), or a raw URL. "
+                         "Sets HF_ENDPOINT env var for this process.")
     ap.add_argument("--list", action="store_true",
                     help="list candidates and exit")
     ap.add_argument("--dry_run", action="store_true",
@@ -109,7 +193,15 @@ def main():
     ap.add_argument("--skip_safetensors_only", action="store_true",
                     help="download ALL files including PyTorch .bin (default "
                          "skips .bin to save space since safetensors suffice)")
+    ap.add_argument("--check_only", action="store_true",
+                    help="only verify existing local dirs, no download")
+    ap.add_argument("--min_weights_gb", type=float, default=1.0,
+                    help="minimum expected total weight size in GB (per model). "
+                         "Downgrade for small models like Qwen3-4B (~8GB).")
     args = ap.parse_args()
+
+    # Apply mirror BEFORE importing huggingface_hub (env var must be set early)
+    apply_mirror(args.mirror)
 
     if args.list:
         print("Candidate Qwen models:")
@@ -147,29 +239,60 @@ def main():
             "merges.txt", "chat_template*",
         ]
 
+    if args.check_only:
+        print("[DL] --check_only: verifying local dirs without download")
+        all_ok = True
+        for rid in targets:
+            ld = local_dir_for(rid)
+            ok, issues = check_downloaded(ld, min_weights_gb=args.min_weights_gb)
+            status = "✓" if ok else "✗"
+            print(f"  {status} {rid}  ({ld})")
+            for iss in issues:
+                print(f"      - {iss}")
+            all_ok = all_ok and ok
+        sys.exit(0 if all_ok else 1)
+
     for rid in targets:
         ld = local_dir_for(rid)
         download_one(rid, ld, dry_run=args.dry_run, allow_patterns=allow_patterns)
 
-    # Summary
+    # Summary + verification
     if not args.dry_run:
         print()
         print("═" * 60)
-        print("[DL] Download complete. Local paths:")
+        print("[DL] Download complete. Verifying files…")
+        all_ok = True
         for rid in targets:
             ld = local_dir_for(rid)
-            if ld.exists():
-                size_mb = sum(f.stat().st_size for f in ld.rglob("*") if f.is_file()) / 1e9
-                print(f"       {rid}  →  {ld}  ({size_mb:.1f} GB)")
+            if not ld.exists():
+                print(f"  ✗ {rid}: dir missing {ld}")
+                all_ok = False
+                continue
+            size_gb = sum(f.stat().st_size for f in ld.rglob("*") if f.is_file()) / 1e9
+            ok, issues = check_downloaded(ld, min_weights_gb=args.min_weights_gb)
+            status = "✓" if ok else "✗"
+            print(f"  {status} {rid}  →  {ld}  ({size_gb:.1f} GB)")
+            for iss in issues:
+                print(f"      - {iss}")
+            all_ok = all_ok and ok
+
         print()
-        print("Next steps:")
-        print("  (a) Use as T6 teacher (local mode):")
-        print("      python scripts/validate/t6_teacher_trace.py \\")
-        print("          --teacher local \\")
-        print("          --local_model checkpoints/Qwen__Qwen3-8B")
-        print("  (b) Verify model loads:")
-        print("      python -c \"from transformers import AutoTokenizer; "
-              "AutoTokenizer.from_pretrained('checkpoints/Qwen__Qwen3-8B')\"")
+        if all_ok:
+            print("[DL] ALL MODELS VERIFIED ✓")
+            print()
+            example = targets[0]
+            ld = local_dir_for(example)
+            print("Next steps:")
+            print(f"  (a) Use as T6 teacher (local mode):")
+            print(f"      python scripts/validate/t6_teacher_trace.py \\")
+            print(f"          --teacher local --local_model {ld}")
+            print(f"  (b) Verify model loads in transformers:")
+            print(f"      python -c \"from transformers import AutoTokenizer; "
+                  f"AutoTokenizer.from_pretrained('{ld}')\"")
+        else:
+            print("[DL] Some models FAILED verification. Re-run to resume, "
+                  "or inspect issues above.")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -203,10 +203,26 @@ def query_teacher(args, prompt: str) -> str:
 def load_prompts_for_t6(
     groups: list[str], n: int,
     fail_indices: list[int] | None, ok_indices: list[int] | None,
+    scope_path: str | None = None,
+    scope_group: str = "gsm8k",
 ) -> list[tuple[str, int, dict]]:
-    """Same semantics as strategy_search.load_prompts but inlined here to
-    avoid depending on SS import."""
+    """Load prompts.
+
+    If ``scope_path`` is given, read the whole file as a single group labelled
+    ``scope_group`` (ignoring fail_indices / ok_indices). This is the 'Full'
+    track in the v1.6 plan (gsm8k_train_prompts.json).
+
+    Otherwise, read default fail/ok scope per groups + optional indices.
+    """
     out = []
+    if scope_path:
+        data = json.loads(Path(scope_path).read_text(encoding="utf-8"))
+        if n:
+            data = data[:n]
+        for i, r in enumerate(data):
+            out.append((scope_group, i, r))
+        return out
+
     if "fail" in groups:
         all_fails = json.loads(SCOPE_FAIL.read_text(encoding="utf-8"))
         if fail_indices is not None:
@@ -247,12 +263,19 @@ def main():
     ap.add_argument("--out_jsonl", type=str, default=None)
     ap.add_argument("--sleep_ms", type=int, default=100,
                     help="sleep between API calls to avoid rate limits")
+    ap.add_argument("--scope_path", type=str, default=None,
+                    help="override default fail/ok scope; read single scope "
+                         "from this JSON (e.g. gsm8k_train_prompts.json)")
+    ap.add_argument("--scope_group", type=str, default="gsm8k",
+                    help="group label for --scope_path items (default 'gsm8k')")
     add_common_args(ap)
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     fail_idx, ok_idx = _parse_index_spec(args.prompt_indices)
-    prompts = load_prompts_for_t6(groups, args.n, fail_idx, ok_idx)
+    prompts = load_prompts_for_t6(groups, args.n, fail_idx, ok_idx,
+                                   scope_path=args.scope_path,
+                                   scope_group=args.scope_group)
 
     run_dir = resolve_run_dir(args, "t6_teacher_trace", OUT_BASE)
     rd = RunDir(
