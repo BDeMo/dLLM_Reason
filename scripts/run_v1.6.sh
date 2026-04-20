@@ -14,22 +14,28 @@
 # before the next phase runs. Safe to interrupt and re-run.
 #
 # Usage:
-#   bash scripts/run_v1.6.sh              # defaults (4B teacher, 2000 prompts)
+#   bash scripts/run_v1.6.sh              # defaults: T6 only, single GPU
 #   bash scripts/run_v1.6.sh --mirror hf-mirror
+#   bash scripts/run_v1.6.sh --t6_gpus 8  # multi-GPU teacher trace gen
 #   bash scripts/run_v1.6.sh --teacher_size 3.5-9B --max_train 5000
-#   bash scripts/run_v1.6.sh --from_phase 2   # skip T6, only run T7+eval+archive
-#   bash scripts/run_v1.6.sh --dry_run        # print plan, no execution
-#   bash scripts/run_v1.6.sh --check_only     # verify artifacts, no work
-#   bash scripts/run_v1.6.sh --smoke          # fast validation: 200 prompts,
-#                                             # N=4, 500 steps each
-#   bash scripts/run_v1.6.sh --skip_qwen      # skip Qwen download (e.g. if
-#                                             # already downloaded separately)
-#   bash scripts/run_v1.6.sh --skip_gsm8k     # skip gsm8k dataset download
+#   bash scripts/run_v1.6.sh --smoke      # fast validation: 200 prompts
+#   bash scripts/run_v1.6.sh --include_t7 # legacy: also run T7 (deprecated)
+#   bash scripts/run_v1.6.sh --from_phase 1   # skip Phase 0 downloads
+#   bash scripts/run_v1.6.sh --dry_run
+#   bash scripts/run_v1.6.sh --check_only
+#
+# Scope change from earlier drafts:
+#   v1.6 is T6-ONLY (canvas distill from AR teacher). T7 (self-distill)
+#   moved to a future release. Pass --include_t7 to opt back in.
+#
+# Multi-GPU:
+#   --t6_gpus N launches N local-Qwen instances for parallel teacher
+#   trace generation (each on CUDA_VISIBLE_DEVICES=0..N-1). T6 SFT itself
+#   remains single-GPU for now (LLaDA-8B fits on one A100 80GB at bs=4).
 #
 # Auto behavior:
-#   If T6 (Phase 1) is not in the active phase range, Qwen download is
-#   auto-skipped. If neither T6 nor T7 (Phase 2) is in range, gsm8k
-#   download is auto-skipped.
+#   If Phase 1 (T6) not in active range, Qwen download auto-skipped.
+#   If no training phase in range, gsm8k download auto-skipped.
 
 set -euo pipefail
 
@@ -48,12 +54,14 @@ BATCH_SIZE=4
 GRAD_ACCUM=4
 SERVER_URL="http://127.0.0.1:8000"
 FROM_PHASE=0
-TO_PHASE=4
+TO_PHASE=3                      # v1.6 stops at eval; T7 dropped for now
 DRY_RUN=0
 CHECK_ONLY=0
 SMOKE=0
 SKIP_QWEN=0
 SKIP_GSM8K=0
+T6_GPUS=1                       # single GPU default; set --t6_gpus 8 for shards
+INCLUDE_T7=0                    # explicit opt-in to legacy T7 phase
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -74,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --skip_qwen)      SKIP_QWEN=1;         shift ;;
         --skip_gsm8k)     SKIP_GSM8K=1;        shift ;;
         --smoke)          SMOKE=1;             shift ;;
+        --t6_gpus)        T6_GPUS="$2";        shift 2 ;;
+        --include_t7)     INCLUDE_T7=1; TO_PHASE=4; shift ;;
         -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "[V1.6] unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -194,8 +204,8 @@ cat <<EOF
   MAX_TRAIN       = $MAX_TRAIN (gsm8k train subset)
   PHASES          = $FROM_PHASE ... $TO_PHASE
   DRY_RUN         = $DRY_RUN   CHECK_ONLY = $CHECK_ONLY
-  T7              temps=$T7_TEMPS  N=$T7_N_SAMPLES  gen=$T7_GEN_LENGTH  steps=$T7_MAX_STEPS
-  T6              retries=$T6_RETRIES  steps=$T6_MAX_STEPS
+  T6              retries=$T6_RETRIES  steps=$T6_MAX_STEPS  gpus=$T6_GPUS
+  INCLUDE_T7      = $INCLUDE_T7  (T7 N=$T7_N_SAMPLES steps=$T7_MAX_STEPS if enabled)
   SFT             bs=$BATCH_SIZE  grad_accum=$GRAD_ACCUM  (effective=$((BATCH_SIZE * GRAD_ACCUM)))
 EOF
 
@@ -254,13 +264,24 @@ phase_1() {
     hdr "Phase 1 — T6 canvas distill (AR-teacher, main contribution)"
 
     # 1a: teacher trace generation (local Qwen3.5-4B)
-    run_or_dry "T6 teacher trace generation" \
-        python scripts/validate/t6_teacher_trace.py \
-        --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
-        --n "$MAX_TRAIN" \
-        --teacher local --local_model "$TEACHER_CKPT" \
-        --retries_per_prompt "$T6_RETRIES" \
-        --max_tokens 800 --temperature 0.0
+    # Single-GPU path vs multi-GPU shard orchestrator
+    if [[ "$T6_GPUS" -gt 1 ]]; then
+        run_or_dry "T6 teacher trace generation ($T6_GPUS-GPU shard)" \
+            bash scripts/run_t6_shards.sh \
+            --gpus "$T6_GPUS" \
+            --max_train "$MAX_TRAIN" \
+            --teacher_ckpt "$TEACHER_CKPT" \
+            --retries "$T6_RETRIES" \
+            --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k
+    else
+        run_or_dry "T6 teacher trace generation (single-GPU)" \
+            python scripts/validate/t6_teacher_trace.py \
+            --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
+            --n "$MAX_TRAIN" \
+            --teacher local --local_model "$TEACHER_CKPT" \
+            --retries_per_prompt "$T6_RETRIES" \
+            --max_tokens 800 --temperature 0.0
+    fi
 
     # Resolve latest T6 run dir
     T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
@@ -444,7 +465,9 @@ fi
 # verified downloads elsewhere and want to start from T6.
 phase_0
 [[ "$FROM_PHASE" -le 1 && "$TO_PHASE" -ge 1 ]] && phase_1
-[[ "$FROM_PHASE" -le 2 && "$TO_PHASE" -ge 2 ]] && phase_2
+if [[ "$INCLUDE_T7" -eq 1 ]]; then
+    [[ "$FROM_PHASE" -le 2 && "$TO_PHASE" -ge 2 ]] && phase_2
+fi
 [[ "$FROM_PHASE" -le 3 && "$TO_PHASE" -ge 3 ]] && phase_3
 [[ "$FROM_PHASE" -le 4 && "$TO_PHASE" -ge 4 ]] && phase_4
 

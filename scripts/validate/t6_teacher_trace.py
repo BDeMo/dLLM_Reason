@@ -268,14 +268,35 @@ def main():
                          "from this JSON (e.g. gsm8k_train_prompts.json)")
     ap.add_argument("--scope_group", type=str, default="gsm8k",
                     help="group label for --scope_path items (default 'gsm8k')")
+    # Multi-GPU sharding (same scheme as strategy_search.py)
+    ap.add_argument("--prompt_start", type=int, default=None,
+                    help="shard slice start (inclusive) into the loaded "
+                         "prompts list. Use with --prompt_end for multi-GPU.")
+    ap.add_argument("--prompt_end", type=int, default=None,
+                    help="shard slice end (exclusive). Defaults to len(prompts).")
+    ap.add_argument("--skip_aggregate", action="store_true",
+                    help="shard workers should set this; final aggregate pass "
+                         "(no slice) rebuilds the global t6_sft.jsonl from all "
+                         "per_prompt/*.json")
     add_common_args(ap)
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     fail_idx, ok_idx = _parse_index_spec(args.prompt_indices)
-    prompts = load_prompts_for_t6(groups, args.n, fail_idx, ok_idx,
-                                   scope_path=args.scope_path,
-                                   scope_group=args.scope_group)
+    prompts_full = load_prompts_for_t6(groups, args.n, fail_idx, ok_idx,
+                                        scope_path=args.scope_path,
+                                        scope_group=args.scope_group)
+
+    # Apply shard slice to the WORK list (todo). Aggregation step reads from
+    # ALL per_prompt/*.json so shards + final pass agree on scope.
+    if args.prompt_start is not None or args.prompt_end is not None:
+        s = args.prompt_start if args.prompt_start is not None else 0
+        e = args.prompt_end if args.prompt_end is not None else len(prompts_full)
+        prompts = prompts_full[s:e]
+        print(f"[T6] shard slice: prompts[{s}:{e}] → {len(prompts)} prompts "
+              f"(of {len(prompts_full)} total)")
+    else:
+        prompts = prompts_full
 
     run_dir = resolve_run_dir(args, "t6_teacher_trace", OUT_BASE)
     rd = RunDir(
@@ -357,9 +378,16 @@ def main():
         status = "✓" if accepted_trace else "✗"
         pp.tick(f"{key} {status}")
 
-    # ── Build SFT JSONL ──────────────────────────────────────────────────────
+    if args.skip_aggregate:
+        print()
+        print(f"[T6] --skip_aggregate set; shard done. Run a final no-slice "
+              f"pass without --skip_aggregate to build the global SFT JSONL.")
+        return
+
+    # ── Build SFT JSONL from ALL per_prompt files (so shards + final pass
+    # agree on scope, like strategy_search.py's approach) ────────────────────
     all_recs = []
-    for group, idx, rec in prompts:
+    for group, idx, rec in prompts_full:
         p = rd.per_prompt / f"{prompt_key(group, idx)}.json"
         if p.exists():
             all_recs.append(json.loads(p.read_text(encoding="utf-8")))
