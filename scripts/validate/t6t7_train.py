@@ -103,6 +103,22 @@ def main():
                              max_seq_len=args.max_seq_len)
         tokenizer = model.tokenizer
 
+        # Ensure all parameters require grad + model is in train mode.
+        # AutoModel.from_pretrained + device_map='auto' can leave params
+        # with requires_grad=False; without this the loss has no grad_fn
+        # and loss.backward() raises
+        #   "element 0 of tensors does not require grad and does not have a grad_fn"
+        model.train()
+        n_params = 0
+        n_trainable = 0
+        for p in model.parameters():
+            p.requires_grad_(True)
+            n_params += p.numel()
+            if p.requires_grad:
+                n_trainable += p.numel()
+        print(f"[T6T7] model: {n_params/1e6:.1f}M params, "
+              f"{n_trainable/1e6:.1f}M trainable (should equal n_params)")
+
     # ── Load dataset ─────────────────────────────────────────────────────────
     train_ds, val_ds = build_jsonl_dataset(
         args.jsonl_path, tokenizer, args.max_seq_len, args.prompt_template,
