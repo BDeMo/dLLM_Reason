@@ -17,9 +17,19 @@
 #   bash scripts/run_v1.6.sh              # defaults (4B teacher, 2000 prompts)
 #   bash scripts/run_v1.6.sh --mirror hf-mirror
 #   bash scripts/run_v1.6.sh --teacher_size 3.5-9B --max_train 5000
-#   bash scripts/run_v1.6.sh --from_phase 2   # skip phases 0-1, start from T6
+#   bash scripts/run_v1.6.sh --from_phase 2   # skip T6, only run T7+eval+archive
 #   bash scripts/run_v1.6.sh --dry_run        # print plan, no execution
 #   bash scripts/run_v1.6.sh --check_only     # verify artifacts, no work
+#   bash scripts/run_v1.6.sh --smoke          # fast validation: 200 prompts,
+#                                             # N=4, 500 steps each
+#   bash scripts/run_v1.6.sh --skip_qwen      # skip Qwen download (e.g. if
+#                                             # already downloaded separately)
+#   bash scripts/run_v1.6.sh --skip_gsm8k     # skip gsm8k dataset download
+#
+# Auto behavior:
+#   If T6 (Phase 1) is not in the active phase range, Qwen download is
+#   auto-skipped. If neither T6 nor T7 (Phase 2) is in range, gsm8k
+#   download is auto-skipped.
 
 set -euo pipefail
 
@@ -41,6 +51,9 @@ FROM_PHASE=0
 TO_PHASE=4
 DRY_RUN=0
 CHECK_ONLY=0
+SMOKE=0
+SKIP_QWEN=0
+SKIP_GSM8K=0
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -58,6 +71,9 @@ while [[ $# -gt 0 ]]; do
         --to_phase)       TO_PHASE="$2";       shift 2 ;;
         --dry_run)        DRY_RUN=1;           shift ;;
         --check_only)     CHECK_ONLY=1;        shift ;;
+        --skip_qwen)      SKIP_QWEN=1;         shift ;;
+        --skip_gsm8k)     SKIP_GSM8K=1;        shift ;;
+        --smoke)          SMOKE=1;             shift ;;
         -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "[V1.6] unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -76,6 +92,32 @@ T6_SFT_JSONL=""
 T6_CKPT_DIR="$ROOT/runs/training/v16_t6"
 T7_CKPT_DIR="$ROOT/runs/training/v16_t7"
 EVAL_DIR="$ROOT/runs/validation/v16_eval"
+
+# Apply --smoke preset (small, fast pipeline validation)
+if [[ "$SMOKE" -eq 1 ]]; then
+    MAX_TRAIN=${MAX_TRAIN:-200}
+    [[ "$MAX_TRAIN" -gt 200 ]] && MAX_TRAIN=200
+    T7_TEMPS="0.7"
+    T7_N_SAMPLES=4
+    T7_MAX_STEPS=500
+    T6_MAX_STEPS=500
+    T6_RETRIES=2
+    echo "[V1.6] --smoke preset: MAX_TRAIN=$MAX_TRAIN  T7_N=$T7_N_SAMPLES  "
+    echo "        T7_temps=$T7_TEMPS  T7_steps=$T7_MAX_STEPS  T6_steps=$T6_MAX_STEPS"
+fi
+
+# Auto-skip Qwen download if T6 is NOT in the active phase range (Phase 1).
+# T7 (Phase 2) doesn't need Qwen, so skipping it saves ~8GB for T7-only runs.
+if [[ "$FROM_PHASE" -gt 1 || "$TO_PHASE" -lt 1 ]] && [[ "$SKIP_QWEN" -eq 0 ]]; then
+    SKIP_QWEN=1
+    echo "[V1.6] T6 (Phase 1) not in active range \u2192 auto-skip Qwen download"
+fi
+
+# Auto-skip gsm8k download if neither T6 (Phase 1) nor T7 (Phase 2) run
+if [[ "$FROM_PHASE" -gt 2 || "$TO_PHASE" -lt 1 ]] && [[ "$SKIP_GSM8K" -eq 0 ]]; then
+    SKIP_GSM8K=1
+    echo "[V1.6] Neither T6 nor T7 in active range \u2192 auto-skip gsm8k download"
+fi
 
 if [[ -z "$TEACHER_CKPT" ]]; then
     # Qwen3.5 repos have NO '-Instruct' suffix (verified on HF 2026-04-19);
@@ -163,23 +205,35 @@ EOF
 phase_0() {
     hdr "Phase 0 — Downloads + data prep"
 
-    # 0a: Qwen teacher
-    run_or_dry "Download Qwen teacher ($TEACHER_SIZE)" \
-        python scripts/download_qwen.py \
-        --sizes "$TEACHER_SIZE" --mirror "$MIRROR"
+    # 0a: Qwen teacher (only if T6 will run)
+    if [[ "$SKIP_QWEN" -eq 1 ]]; then
+        echo "[PHASE 0] skip Qwen download (T6 not in active phase range)"
+    else
+        run_or_dry "Download Qwen teacher ($TEACHER_SIZE)" \
+            python scripts/download_qwen.py \
+            --sizes "$TEACHER_SIZE" --mirror "$MIRROR"
+    fi
 
-    # 0b: gsm8k train
-    run_or_dry "Load gsm8k train prompts (max $MAX_TRAIN)" \
-        python scripts/validate/load_gsm8k_train.py \
-        --mirror "$MIRROR" --max_samples "$MAX_TRAIN"
+    # 0b: gsm8k train (only if T6 or T7 will run)
+    if [[ "$SKIP_GSM8K" -eq 1 ]]; then
+        echo "[PHASE 0] skip gsm8k download (no training phase in active range)"
+    else
+        run_or_dry "Load gsm8k train prompts (max $MAX_TRAIN)" \
+            python scripts/validate/load_gsm8k_train.py \
+            --mirror "$MIRROR" --max_samples "$MAX_TRAIN"
+    fi
 
-    # 0c: verify
+    # 0c: verify what we downloaded
     echo
     echo "[CHECK Phase 0 outputs]"
     local ok=1
-    python scripts/download_qwen.py --sizes "$TEACHER_SIZE" --check_only \
-        --min_weights_gb 1.0 || ok=0
-    check_file "$GSM8K_TRAIN_JSON" "gsm8k train JSON" 1000 || ok=0
+    if [[ "$SKIP_QWEN" -eq 0 ]]; then
+        python scripts/download_qwen.py --sizes "$TEACHER_SIZE" --check_only \
+            --min_weights_gb 1.0 || ok=0
+    fi
+    if [[ "$SKIP_GSM8K" -eq 0 ]]; then
+        check_file "$GSM8K_TRAIN_JSON" "gsm8k train JSON" 1000 || ok=0
+    fi
     [[ "$ok" -eq 1 ]] && echo "[PHASE 0] ✓ PASS" || { echo "[PHASE 0] ✗ FAIL"; exit 1; }
 }
 
@@ -383,7 +437,12 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     exit $([[ "$ok" -eq 1 ]] && echo 0 || echo 1)
 fi
 
-[[ "$FROM_PHASE" -le 0 && "$TO_PHASE" -ge 0 ]] && phase_0
+# Phase 0 (data dependencies) always runs — its steps are idempotent
+# (snapshot_download resumes, load_gsm8k_train skips if JSON exists) and
+# subsequent phases need the data. SKIP_QWEN / SKIP_GSM8K still respected
+# inside phase_0 for fine control. Use --from_phase 1+ if you've already
+# verified downloads elsewhere and want to start from T6.
+phase_0
 [[ "$FROM_PHASE" -le 1 && "$TO_PHASE" -ge 1 ]] && phase_1
 [[ "$FROM_PHASE" -le 2 && "$TO_PHASE" -ge 2 ]] && phase_2
 [[ "$FROM_PHASE" -le 3 && "$TO_PHASE" -ge 3 ]] && phase_3
