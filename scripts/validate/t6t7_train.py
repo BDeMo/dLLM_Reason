@@ -166,10 +166,11 @@ def main():
     hf_dir = save_dir / "hf"
     hf_dir.mkdir(parents=True, exist_ok=True)
     try:
-        # LLaDAWrapper exposes the underlying HF model as self.model_internal
-        # (or self._model / self.model). Try a few conventional names.
+        # LLaDAWrapper exposes the underlying HF model as self._llada
+        # (confirmed in src/dllm_reason/models/llada.py). Try a few
+        # conventional names as fallback in case wrapper attribute changes.
         inner = None
-        for attr in ("model_internal", "_model", "model"):
+        for attr in ("_llada", "_model", "model_internal", "model"):
             if hasattr(model, attr):
                 cand = getattr(model, attr)
                 if hasattr(cand, "save_pretrained"):
@@ -178,7 +179,7 @@ def main():
         if inner is None:
             raise AttributeError(
                 "could not find underlying HF model on LLaDAWrapper "
-                "(tried .model_internal, ._model, .model)"
+                "(tried ._llada, ._model, .model_internal, .model)"
             )
         inner.save_pretrained(hf_dir, safe_serialization=True)
         if hasattr(model, "tokenizer"):
