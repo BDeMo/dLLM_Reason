@@ -107,9 +107,22 @@ def build_jsonl_dataset(
     rng = random.Random(seed)
     shuffled = list(all_data)
     rng.shuffle(shuffled)
-    n_val = max(1, int(len(shuffled) * train_val_split))
-    val_data = shuffled[:n_val]
-    train_data = shuffled[n_val:]
+
+    # Edge case: very few records. Need at least 1 in train to be trainable.
+    # If only 1 record exists, put it in train (no val). If ≥ 2, reserve at
+    # least 1 for val but always leave at least 1 for train.
+    n_total = len(shuffled)
+    if n_total < 2:
+        val_data = []
+        train_data = shuffled
+        logger.warning(
+            f"Only {n_total} record(s); skipping val split (all in train)."
+        )
+    else:
+        n_val = max(1, int(n_total * train_val_split))
+        n_val = min(n_val, n_total - 1)   # leave ≥ 1 for train
+        val_data = shuffled[:n_val]
+        train_data = shuffled[n_val:]
 
     # Reuse ReasoningDataset directly with in-memory data (skip re-reading file)
     train_records = [
