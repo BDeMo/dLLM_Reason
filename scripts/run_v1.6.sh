@@ -278,10 +278,34 @@ phase_2() {
 # ═════════════════════════════════════════════════════════════════════════════
 phase_3() {
     hdr "Phase 3 — Eval on held-out scope_fail + scope_ok"
-    echo "[PHASE 3] TODO: wire a dedicated eval runner (next commit)."
-    echo "[PHASE 3] For now, manually eval by spinning up serve with the new ckpt:"
-    echo "   python scripts/serve.py --model_id $T6_CKPT_DIR/best.pt --port 8000"
-    echo "   python scripts/validate/h3_passN_at_temperature.py --n 60 --temperatures 0"
+
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    EVAL_DIR="$ROOT/runs/validation/v16_eval_${ts}"
+
+    # Build list of ckpts: baseline + any existing stage dirs
+    local args=("--out_dir" "$EVAL_DIR"
+                "--gen_length" "$T7_GEN_LENGTH"
+                "--block_length" "32"
+                "--temperature" "0.0"
+                "--ckpts"
+                "baseline=GSAI-ML/LLaDA-8B-Instruct")
+    if [[ -d "$T7_CKPT_DIR/hf" ]]; then
+        args+=("t7_stage1=$T7_CKPT_DIR/hf")
+    fi
+    if [[ -d "$T6_CKPT_DIR/hf" ]]; then
+        args+=("t6_stage2=$T6_CKPT_DIR/hf")
+    fi
+
+    run_or_dry "v1.6 eval on scope_fail + scope_ok" \
+        python scripts/validate/v16_eval.py "${args[@]}"
+
+    echo
+    echo "[CHECK Phase 3 outputs]"
+    local ok=1
+    check_file "$EVAL_DIR/summary.json" "eval summary" 100 || ok=0
+    check_file "$EVAL_DIR/comparison.md" "eval comparison md" 50 || ok=0
+    [[ "$ok" -eq 1 ]] && echo "[PHASE 3] ✓ PASS" || { echo "[PHASE 3] ✗ FAIL"; exit 1; }
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -289,11 +313,51 @@ phase_3() {
 # ═════════════════════════════════════════════════════════════════════════════
 phase_4() {
     hdr "Phase 4 — Archive results"
-    echo "[PHASE 4] TODO: write to docs/archive/finding_v1.6_*.zh.md"
-    echo "[PHASE 4] Inputs needed:"
-    echo "          - Phase 3 eval numbers"
-    echo "          - FAIL18 / ceiling5 rescue delta"
-    echo "          - Training loss curves"
+
+    # Point at the latest eval dir if Phase 3 ran in the same invocation
+    local latest_eval
+    latest_eval=$(ls -dt "$ROOT"/runs/validation/v16_eval_* 2>/dev/null | head -1)
+    if [[ -z "$latest_eval" ]]; then
+        echo "[PHASE 4] no v16_eval_* dir found; run Phase 3 first"
+        return 1
+    fi
+
+    local archive_doc="$ROOT/docs/archive/finding_v1.6_selfdistill_canvas.zh.md"
+    echo "[PHASE 4] stub archive doc @ $archive_doc"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY-RUN] would write archive doc from $latest_eval/summary.json"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$archive_doc")"
+    cat > "$archive_doc" <<EOF
+# Finding v1.6 —— Self-Distill + AR-Teacher Canvas SFT
+
+**日期**：$(date +%Y-%m-%d)
+**前置 plan**：\`docs/plans/2026-04-19_v1.6_plan.zh.md\`
+**Eval run**：\`${latest_eval#$ROOT/}\`
+
+## 数字
+
+请看同目录 \`comparison.md\`:
+
+\`\`\`
+$(cat "$latest_eval/comparison.md" 2>/dev/null || echo '(comparison.md missing — Phase 3 did not complete)')
+\`\`\`
+
+## 结论
+
+TODO: fill in after reviewing numbers
+
+## 相关
+
+- Plan: \`docs/plans/2026-04-19_v1.6_plan.zh.md\`
+- Related work: \`docs/plans/2026-04-19_related_work_review.zh.md\`
+- Ablation index: \`docs/archive/ablation_index.zh.md\`
+EOF
+
+    echo "[PHASE 4] stub archive written: $archive_doc"
+    echo "[PHASE 4] fill 结论 section manually after review"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════

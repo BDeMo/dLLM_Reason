@@ -158,6 +158,46 @@ def main():
     trainer = Finetuner(model, train_loader, val_loader, cfg)
     trainer.train()
 
+    # ── Export HF-format checkpoint for serving ──────────────────────────────
+    # Finetuner saves .pt with {"model_state_dict": ...}, which cannot be loaded
+    # by AutoModel.from_pretrained. We additionally save an HF-format dir
+    # (config.json + *.safetensors + tokenizer files) so scripts/serve.py and
+    # any downstream eval can load the trained ckpt via --model_id.
+    hf_dir = save_dir / "hf"
+    hf_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # LLaDAWrapper exposes the underlying HF model as self.model_internal
+        # (or self._model / self.model). Try a few conventional names.
+        inner = None
+        for attr in ("model_internal", "_model", "model"):
+            if hasattr(model, attr):
+                cand = getattr(model, attr)
+                if hasattr(cand, "save_pretrained"):
+                    inner = cand
+                    break
+        if inner is None:
+            raise AttributeError(
+                "could not find underlying HF model on LLaDAWrapper "
+                "(tried .model_internal, ._model, .model)"
+            )
+        inner.save_pretrained(hf_dir, safe_serialization=True)
+        if hasattr(model, "tokenizer"):
+            model.tokenizer.save_pretrained(hf_dir)
+        # Copy any trust_remote_code files from the source checkpoint
+        # (modeling_llada.py, configuration_llada.py, etc.) if they exist
+        src_path = Path(args.init_ckpt)
+        if src_path.exists() and src_path.is_dir():
+            import shutil
+            for name in ("modeling_llada.py", "configuration_llada.py",
+                         "tokenization_llada.py"):
+                src = src_path / name
+                if src.is_file():
+                    shutil.copy2(src, hf_dir / name)
+        print(f"[T6T7] HF-format ckpt → {hf_dir}")
+    except Exception as e:
+        print(f"[T6T7] WARN: HF export failed: {e}")
+        print(f"[T6T7] .pt checkpoints still usable via load_checkpoint()")
+
     print(f"[T6T7] done. checkpoints → {save_dir}")
 
 
