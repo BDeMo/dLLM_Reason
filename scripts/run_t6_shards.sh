@@ -22,6 +22,7 @@ TEACHER_CKPT=""           # auto = checkpoints/Qwen__Qwen3.5-4B
 TEACHER_SIZE="3.5-4B"
 T6_RETRIES=3
 T6_MAX_TOKENS=800
+T6_BATCH_SIZE=4           # HF pipeline batch size per shard (1 = serial/legacy)
 SCOPE_PATH=""             # auto = runs/validation/gsm8k_train_prompts.json
 SCOPE_GROUP="gsm8k"
 RUN_DIR=""                # auto = runs/validation/t6_teacher_trace_<ts>
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --teacher_size)   TEACHER_SIZE="$2";  shift 2 ;;
         --retries)        T6_RETRIES="$2";    shift 2 ;;
         --max_tokens)     T6_MAX_TOKENS="$2"; shift 2 ;;
+        --batch_size)     T6_BATCH_SIZE="$2"; shift 2 ;;
         --scope_path)     SCOPE_PATH="$2";    shift 2 ;;
         --scope_group)    SCOPE_GROUP="$2";   shift 2 ;;
         -r|--run_dir)     RUN_DIR="$2";       shift 2 ;;
@@ -67,6 +69,7 @@ echo "[T6-SH] TEACHER_CKPT  = $TEACHER_CKPT"
 echo "[T6-SH] SCOPE_PATH    = $SCOPE_PATH"
 echo "[T6-SH] MAX_TRAIN     = $MAX_TRAIN"
 echo "[T6-SH] T6_RETRIES    = $T6_RETRIES"
+echo "[T6-SH] T6_BATCH_SIZE = $T6_BATCH_SIZE (HF pipeline batch size per shard)"
 echo "[T6-SH] RUN_DIR       = $RUN_DIR"
 echo "[T6-SH]"
 
@@ -155,6 +158,7 @@ for ((g=0; g<GPUS; g++)); do
         --teacher local --local_model "$TEACHER_CKPT" \
         --retries_per_prompt "$T6_RETRIES" \
         --max_tokens "$T6_MAX_TOKENS" --temperature 0.0 \
+        --batch_size "$T6_BATCH_SIZE" \
         --prompt_start "$S" --prompt_end "$E" \
         --skip_aggregate \
         > "$LOG" 2>&1 &
@@ -195,7 +199,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u \
     --n "$MAX_TRAIN" \
     --teacher local --local_model "$TEACHER_CKPT" \
     --retries_per_prompt "$T6_RETRIES" \
-    --max_tokens "$T6_MAX_TOKENS" --temperature 0.0
+    --max_tokens "$T6_MAX_TOKENS" --temperature 0.0 \
+    --batch_size "$T6_BATCH_SIZE"
 
 echo
 echo "[T6-SH] DONE. run_dir = $RUN_DIR"

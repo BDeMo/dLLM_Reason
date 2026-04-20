@@ -162,10 +162,65 @@ def query_anthropic(model: str, prompt: str, max_tokens: int = 800,
     )
 
 
+def _get_local_pipe(model_id: str, _cache: dict = {}):
+    """Lazy-load HF text-generation pipeline, cached per-process.
+
+    Also configures left-padding + pad_token for batched generation
+    (required for correct decoder-style batching).
+    """
+    if "pipe" not in _cache:
+        from transformers import pipeline
+        pipe = pipeline(
+            "text-generation", model=model_id, torch_dtype="bfloat16",
+            device_map="auto",
+        )
+        # Prepare for batched generation
+        if pipe.tokenizer.pad_token_id is None:
+            pipe.tokenizer.pad_token_id = pipe.tokenizer.eos_token_id
+        pipe.tokenizer.padding_side = "left"
+        _cache["pipe"] = pipe
+    return _cache["pipe"]
+
+
+def query_local_batch(model_id: str, prompts: list[str],
+                      max_tokens: int = 800, temperature: float = 0.0,
+                      batch_size: int = 4) -> list[str]:
+    """Batched generation. Feeds a list of prompts through the cached pipeline
+    with ``batch_size`` so HF can parallelize decoder forwards.
+
+    Same TEACHER_SYSTEM + TEACHER_USER_TEMPLATE applied to each prompt.
+    Returns outputs aligned to input order (list of 'generated_text' strings,
+    with the prompt stripped via return_full_text=False).
+    """
+    pipe = _get_local_pipe(model_id)
+    full_prompts = [
+        f"<|system|>\n{TEACHER_SYSTEM}\n<|user|>\n"
+        f"{TEACHER_USER_TEMPLATE.format(prompt=p)}\n<|assistant|>\n"
+        for p in prompts
+    ]
+    outs = pipe(
+        full_prompts,
+        max_new_tokens=max_tokens,
+        do_sample=(temperature > 0),
+        temperature=max(temperature, 0.01),
+        return_full_text=False,
+        batch_size=batch_size,
+    )
+    # outs is a list (one per input prompt) where each element is
+    # either a dict {"generated_text": ...} or a list of such dicts.
+    result: list[str] = []
+    for o in outs:
+        if isinstance(o, list):
+            result.append(o[0]["generated_text"])
+        else:
+            result.append(o["generated_text"])
+    return result
+
+
 def query_local(model_id: str, prompt: str, max_tokens: int = 800,
                 temperature: float = 0.0,
                 _cache: dict = {}) -> str:
-    """Lazy-load a local HF model and generate. Cached so we don't reload."""
+    """Single-prompt wrapper (used by retry path / non-batched mode)."""
     if "pipe" not in _cache:
         from transformers import pipeline
         _cache["pipe"] = pipeline(
@@ -242,6 +297,154 @@ def load_prompts_for_t6(
     return out
 
 
+def _write_per_prompt(rd, key: str, group: str, idx, gt: str, prompt: str,
+                      teacher: str, teacher_model: str,
+                      attempts: list, accepted_trace: dict | None) -> None:
+    """Atomic write of one per_prompt json."""
+    import os
+    rec_out = {
+        "group": group, "idx": idx, "gt": gt, "prompt": prompt,
+        "teacher": teacher, "teacher_model": teacher_model,
+        "accepted": accepted_trace is not None,
+        "attempts": attempts,
+        "accepted_trace": accepted_trace,
+    }
+    path = rd.per_prompt / f"{key}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec_out, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _score_trace(trace: str, gt: str) -> tuple[str | None, bool, dict]:
+    """Return (extracted_answer, answer_correct, sections_dict)."""
+    ans = extract_teacher_answer(trace)
+    ans_ok = (ans is not None) and is_correct(ans, gt)
+    sections = parse_sections(trace)
+    return ans, ans_ok, sections
+
+
+def _trace_is_accepted(ans_ok: bool, sections: dict) -> bool:
+    return ans_ok and "ANSWER" in sections and "SETUP" in sections
+
+
+def run_serial(args, todo, rd, pp, prompt_key):
+    """Legacy per-prompt sequential path. Used for api backends + local
+    with batch_size=1."""
+    teacher_model = getattr(args, args.teacher + "_model")
+    for group, idx, rec in todo:
+        prompt, gt = rec["prompt"], rec["ground_truth"]
+        key = prompt_key(group, idx)
+
+        attempts = []
+        accepted_trace = None
+        for attempt in range(args.retries_per_prompt):
+            try:
+                trace = query_teacher(args, prompt)
+            except Exception as e:
+                print(f"[T6] WARN: teacher error at {key} attempt {attempt}: {e}")
+                time.sleep(1.0)
+                continue
+
+            ans, ans_ok, sections = _score_trace(trace, gt)
+            attempts.append({
+                "attempt": attempt, "trace": trace,
+                "teacher_answer": ans, "teacher_answer_correct": ans_ok,
+                "sections": sections,
+            })
+            if _trace_is_accepted(ans_ok, sections):
+                accepted_trace = attempts[-1]
+                break
+            if args.sleep_ms:
+                time.sleep(args.sleep_ms / 1000.0)
+
+        _write_per_prompt(rd, key, group, idx, gt, prompt,
+                          args.teacher, teacher_model,
+                          attempts, accepted_trace)
+        pp.tick(f"{key} {'✓' if accepted_trace else '✗'}")
+
+
+def run_batched_local(args, todo, rd, pp, prompt_key):
+    """Batched local path: feed ``batch_size`` prompts per pipeline call so
+    HF can parallelize the decoder forward. Retries across rounds: each
+    round re-batches only prompts that haven't been accepted yet.
+
+    Addresses the HF warning:
+      'You seem to be using the pipelines sequentially on GPU. In order to
+       maximize efficiency please use a dataset'
+    """
+    teacher_model = args.local_model
+
+    # Per-key state: attempts accumulated, accepted trace (or None)
+    attempts_by_key: dict[str, list] = {}
+    accepted_by_key: dict[str, dict | None] = {}
+    prompt_by_key: dict[str, tuple] = {}   # key -> (group, idx, rec)
+    for group, idx, rec in todo:
+        k = prompt_key(group, idx)
+        attempts_by_key[k] = []
+        accepted_by_key[k] = None
+        prompt_by_key[k] = (group, idx, rec)
+
+    remaining_keys = list(prompt_by_key.keys())
+
+    for round_i in range(args.retries_per_prompt):
+        if not remaining_keys:
+            break
+        still_pending: list[str] = []
+        print(f"[T6] batched round {round_i + 1}/{args.retries_per_prompt}: "
+              f"{len(remaining_keys)} prompts in this round")
+
+        # Process in chunks of batch_size (pipeline handles internal batching,
+        # but we also bound memory per call)
+        BS = args.batch_size
+        for i in range(0, len(remaining_keys), BS):
+            chunk_keys = remaining_keys[i:i + BS]
+            chunk_prompts = [prompt_by_key[k][2]["prompt"] for k in chunk_keys]
+            try:
+                traces = query_local_batch(
+                    args.local_model, chunk_prompts,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    batch_size=BS,
+                )
+            except Exception as e:
+                print(f"[T6] WARN: batch error in round {round_i}: {e}")
+                time.sleep(1.0)
+                # retry this whole chunk in next round
+                still_pending.extend(chunk_keys)
+                continue
+
+            # Score each output in the chunk and update state
+            for k, trace in zip(chunk_keys, traces):
+                (group, idx, rec) = prompt_by_key[k]
+                gt = rec["ground_truth"]
+                ans, ans_ok, sections = _score_trace(trace, gt)
+                attempts_by_key[k].append({
+                    "attempt": round_i, "trace": trace,
+                    "teacher_answer": ans, "teacher_answer_correct": ans_ok,
+                    "sections": sections,
+                })
+                if _trace_is_accepted(ans_ok, sections):
+                    accepted_by_key[k] = attempts_by_key[k][-1]
+                    # write as soon as accepted — resume-safe
+                    _write_per_prompt(rd, k, group, idx, gt, rec["prompt"],
+                                      args.teacher, teacher_model,
+                                      attempts_by_key[k], accepted_by_key[k])
+                    pp.tick(f"{k} ✓")
+                else:
+                    still_pending.append(k)
+
+        remaining_keys = still_pending
+
+    # Write per_prompt for everything that never got accepted
+    for k in remaining_keys:
+        (group, idx, rec) = prompt_by_key[k]
+        _write_per_prompt(rd, k, group, idx, rec["ground_truth"], rec["prompt"],
+                          args.teacher, teacher_model,
+                          attempts_by_key[k], None)
+        pp.tick(f"{k} ✗")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=60)
@@ -278,6 +481,10 @@ def main():
                     help="shard workers should set this; final aggregate pass "
                          "(no slice) rebuilds the global t6_sft.jsonl from all "
                          "per_prompt/*.json")
+    ap.add_argument("--batch_size", type=int, default=4,
+                    help="batch size for local backend (HF pipeline batched "
+                         "mode). Set to 1 to disable batching (legacy serial "
+                         "path). Only applies to --teacher local.")
     add_common_args(ap)
     args = ap.parse_args()
 
@@ -329,54 +536,17 @@ def main():
         return
 
     pp = ProgressPrinter(len(todo), tag="T6 ")
-    for group, idx, rec in todo:
-        prompt, gt = rec["prompt"], rec["ground_truth"]
-        key = prompt_key(group, idx)
 
-        attempts = []
-        accepted_trace = None
-        for attempt in range(args.retries_per_prompt):
-            try:
-                trace = query_teacher(args, prompt)
-            except Exception as e:
-                print(f"[T6] WARN: teacher error at {key} attempt {attempt}: {e}")
-                time.sleep(1.0)  # back off harder on error
-                continue
-
-            ans = extract_teacher_answer(trace)
-            ans_ok = (ans is not None) and is_correct(ans, gt)
-            sections = parse_sections(trace)
-            attempts.append({
-                "attempt": attempt,
-                "trace": trace,
-                "teacher_answer": ans,
-                "teacher_answer_correct": ans_ok,
-                "sections": sections,
-            })
-            if ans_ok and ("ANSWER" in sections) and ("SETUP" in sections):
-                accepted_trace = attempts[-1]
-                break
-
-            if args.sleep_ms:
-                time.sleep(args.sleep_ms / 1000.0)
-
-        rec_out = {
-            "group": group, "idx": idx, "gt": gt,
-            "prompt": prompt,
-            "teacher": args.teacher,
-            "teacher_model": getattr(args, args.teacher + "_model"),
-            "accepted": accepted_trace is not None,
-            "attempts": attempts,
-            "accepted_trace": accepted_trace,
-        }
-        import os
-        path = rd.per_prompt / f"{key}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(rec_out, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, path)
-        status = "✓" if accepted_trace else "✗"
-        pp.tick(f"{key} {status}")
+    # ── Dispatch: batched (local + batch_size > 1) vs serial (api / batch=1) ──
+    use_batched = (args.teacher == "local") and (args.batch_size > 1)
+    if use_batched:
+        print(f"[T6] batched mode: batch_size={args.batch_size}  "
+              f"(suppresses HF 'sequential pipeline' warning; 2-3× faster)")
+        run_batched_local(args, todo, rd, pp, prompt_key)
+    else:
+        if args.teacher == "local":
+            print(f"[T6] serial mode (batch_size=1)")
+        run_serial(args, todo, rd, pp, prompt_key)
 
     if args.skip_aggregate:
         print()
