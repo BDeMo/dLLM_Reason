@@ -104,6 +104,7 @@ active ─┬─> done                    # 按计划完成
 
 | 日期 | 文件 | 状态 | 摘要 |
 |---|---|---|---|
+| 2026-04-19 | [`2026-04-19_v1.6_plan.zh.md`](2026-04-19_v1.6_plan.zh.md) | **active** ⭐ | v1.6: T6 (AR-teacher canvas distill) + T7 (self-distill on sampled-correct) |
 | 2026-04-19 | [`2026-04-19_related_work_review.zh.md`](2026-04-19_related_work_review.zh.md) | active | 15 篇精读：LogicDiff / DAWN / Where-to-Unmask / ReasonFlux / ... + paper positioning |
 | 2026-04-19 | [`2026-04-19_replan_next_phase.zh.md`](2026-04-19_replan_next_phase.zh.md) | **active** ⭐ | 当前 active。SS 搁浅后重新规划 |
 | 2026-04-19 | [`2026-04-19_ss_run_postmortem.zh.md`](2026-04-19_ss_run_postmortem.zh.md) | done | SS 跑 3 天 13.8% 完成度，慢 11× 未定因。止损 |
