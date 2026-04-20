@@ -73,8 +73,8 @@ T7_RUN_DIR=""  # resolved post-run to the timestamped dir
 T6_RUN_DIR=""
 T7_SFT_JSONL=""
 T6_SFT_JSONL=""
-T7_CKPT_DIR="$ROOT/runs/training/v16_t7_stage1"
-T6_CKPT_DIR="$ROOT/runs/training/v16_t6_stage2"
+T6_CKPT_DIR="$ROOT/runs/training/v16_t6"
+T7_CKPT_DIR="$ROOT/runs/training/v16_t7"
 EVAL_DIR="$ROOT/runs/validation/v16_eval"
 
 if [[ -z "$TEACHER_CKPT" ]]; then
@@ -184,22 +184,73 @@ phase_0() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 1 — T7 self-distill: sample + filter + SFT
+#  PHASE 1 — T6: AR-teacher canvas distill (main contribution)
 # ═════════════════════════════════════════════════════════════════════════════
+# T6 before T7 rationale:
+#   1. T6 introduces NEW structural reasoning (canvas <SETUP>/<STEP>/<ANSWER>);
+#      T7 only amplifies LLaDA's existing reasoning. Structure-first is
+#      the cleaner pedagogical order (curriculum learning).
+#   2. T7 cannot help on ceiling-5 prompts (LLaDA pass@8=0 there) → only
+#      T6 can break those. So T6 is the necessary pipeline.
+#   3. Cost parity now that teacher is local Qwen (not paid API), so the
+#      'T7 is cheaper' rationale no longer applies.
+#   4. Running T6 and T7 independently (no warm-start) gives cleaner
+#      attribution: baseline / +T6 / +T7 / +T6+T7 four-way compare.
 phase_1() {
-    hdr "Phase 1 — T7 self-distill"
+    hdr "Phase 1 — T6 canvas distill (AR-teacher, main contribution)"
 
-    # 1a: require serve.py up on SERVER_URL
+    # 1a: teacher trace generation (local Qwen3.5-4B)
+    run_or_dry "T6 teacher trace generation" \
+        python scripts/validate/t6_teacher_trace.py \
+        --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
+        --n "$MAX_TRAIN" \
+        --teacher local --local_model "$TEACHER_CKPT" \
+        --retries_per_prompt "$T6_RETRIES" \
+        --max_tokens 800 --temperature 0.0
+
+    # Resolve latest T6 run dir
+    T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
+    T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+
+    # 1b: T6 SFT from LLaDA baseline (NOT warm-starting from T7 anymore)
+    run_or_dry "T6 SFT (from LLaDA baseline)" \
+        python scripts/validate/t6t7_train.py \
+        --jsonl_path "$T6_SFT_JSONL" \
+        --run_name v16_t6 \
+        --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
+        --max_steps "$T6_MAX_STEPS" \
+        --batch_size "$BATCH_SIZE" --grad_accum_steps "$GRAD_ACCUM" \
+        --lr 2e-5
+
+    # 1c: verify
+    echo
+    echo "[CHECK Phase 1 outputs]"
+    local ok=1
+    check_file "$T6_SFT_JSONL" "T6 SFT JSONL" 100 || ok=0
+    check_dir_nonempty "$T6_CKPT_DIR" "T6 ckpt dir" || ok=0
+    [[ "$ok" -eq 1 ]] && echo "[PHASE 1] ✓ PASS" || { echo "[PHASE 1] ✗ FAIL"; exit 1; }
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 2 — T7: self-distill on sampled-correct (independent add-on)
+# ═════════════════════════════════════════════════════════════════════════════
+# Independent SFT from baseline LLaDA (not warm-start from T6). This gives
+# a clean 4-way attribution in Phase 3 eval: baseline / T6-only / T7-only /
+# T6+T7 combined. T7 is treated as an optional add-on to the main T6 claim.
+phase_2() {
+    hdr "Phase 2 — T7 self-distill (independent add-on)"
+
+    # 2a: require LLaDA serve for T7 sampling
     if [[ "$CHECK_ONLY" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
         if ! curl -sf "$SERVER_URL/health" > /dev/null 2>&1; then
-            echo "[PHASE 1] ERROR: server not reachable at $SERVER_URL"
+            echo "[PHASE 2] ERROR: LLaDA server not reachable at $SERVER_URL"
             echo "  Start: python scripts/serve.py --port 8000"
             exit 1
         fi
-        echo "[PHASE 1] server OK at $SERVER_URL"
+        echo "[PHASE 2] server OK at $SERVER_URL"
     fi
 
-    # 1b: T7 data generation
+    # 2b: T7 data generation (sample + filter correct)
     run_or_dry "T7 sampling + filter correct" \
         python scripts/validate/t7_gen_correct_samples.py \
         --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
@@ -213,63 +264,22 @@ phase_1() {
     T7_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t7_selfdistill_* 2>/dev/null | head -1)
     T7_SFT_JSONL="$T7_RUN_DIR/t7_sft.jsonl"
 
-    # 1c: T7 SFT
-    run_or_dry "T7 SFT (stage 1)" \
+    # 2c: T7 SFT from LLaDA baseline (independent add-on, not warm-start)
+    run_or_dry "T7 SFT (from LLaDA baseline, independent)" \
         python scripts/validate/t6t7_train.py \
         --jsonl_path "$T7_SFT_JSONL" \
-        --run_name v16_t7_stage1 \
+        --run_name v16_t7 \
+        --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
         --max_steps "$T7_MAX_STEPS" \
         --batch_size "$BATCH_SIZE" --grad_accum_steps "$GRAD_ACCUM" \
         --lr 2e-5
 
-    # 1d: verify
-    echo
-    echo "[CHECK Phase 1 outputs]"
-    local ok=1
-    check_file "$T7_SFT_JSONL" "T7 SFT JSONL" 100 || ok=0
-    check_dir_nonempty "$T7_CKPT_DIR" "T7 stage1 ckpt dir" || ok=0
-    [[ "$ok" -eq 1 ]] && echo "[PHASE 1] ✓ PASS" || { echo "[PHASE 1] ✗ FAIL"; exit 1; }
-}
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 2 — T6 canvas distill: teacher trace + SFT warm-start
-# ═════════════════════════════════════════════════════════════════════════════
-phase_2() {
-    hdr "Phase 2 — T6 canvas distill (warm-start from T7)"
-
-    # 2a: teacher trace
-    run_or_dry "T6 teacher trace generation" \
-        python scripts/validate/t6_teacher_trace.py \
-        --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
-        --n "$MAX_TRAIN" \
-        --teacher local --local_model "$TEACHER_CKPT" \
-        --retries_per_prompt "$T6_RETRIES" \
-        --max_tokens 800 --temperature 0.0
-
-    # Resolve latest T6 run dir
-    T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
-    T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
-
-    # 2b: T6 SFT warm-start
-    local init_ckpt="$T7_CKPT_DIR/best.pt"
-    if [[ ! -f "$init_ckpt" && -f "$T7_CKPT_DIR/step_${T7_MAX_STEPS}.pt" ]]; then
-        init_ckpt="$T7_CKPT_DIR/step_${T7_MAX_STEPS}.pt"
-    fi
-    run_or_dry "T6 SFT (stage 2, warm-start)" \
-        python scripts/validate/t6t7_train.py \
-        --jsonl_path "$T6_SFT_JSONL" \
-        --run_name v16_t6_stage2 \
-        --init_ckpt "$init_ckpt" \
-        --max_steps "$T6_MAX_STEPS" \
-        --batch_size "$BATCH_SIZE" --grad_accum_steps "$GRAD_ACCUM" \
-        --lr 1e-5
-
-    # 2c: verify
+    # 2d: verify
     echo
     echo "[CHECK Phase 2 outputs]"
     local ok=1
-    check_file "$T6_SFT_JSONL" "T6 SFT JSONL" 100 || ok=0
-    check_dir_nonempty "$T6_CKPT_DIR" "T6 stage2 ckpt dir" || ok=0
+    check_file "$T7_SFT_JSONL" "T7 SFT JSONL" 100 || ok=0
+    check_dir_nonempty "$T7_CKPT_DIR" "T7 ckpt dir" || ok=0
     [[ "$ok" -eq 1 ]] && echo "[PHASE 2] ✓ PASS" || { echo "[PHASE 2] ✗ FAIL"; exit 1; }
 }
 
