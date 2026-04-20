@@ -26,6 +26,20 @@ Thumbs.db
 # Project artifacts
 results/
 figures/
+runs/
 *.db
 *.faiss
 wandb/
+
+# Scratch notebooks
+test*.ipynb
+paper/
+docs/dLLM_Reason.pdf
+
+# Private notes — brainstorms, critical postmortems, anything not meant for
+# public repo. Local-only. Anything under docs/private/ is never pushed.
+docs/private/
+
+# Project-level scratch / temp files (dry-run fixtures, ad-hoc probes, etc.)
+# Everything stays in-repo working directory for easy cleanup (no /tmp/).
+tmp/

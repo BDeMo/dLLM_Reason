@@ -18,11 +18,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import PreTrainedModel as _PreTrainedModel
+
+# transformers >= 5.x renamed/added `all_tied_weights_keys` (as a dict
+# mapping tied-key -> source-key). LLaDA's remote modeling code only
+# exposes the legacy `_tied_weights_keys` (a list of names). Without this
+# shim, both `infer_auto_device_map` (len check) and `compute_module_sizes`
+# (.keys() call) raise AttributeError during model load.
+if not hasattr(_PreTrainedModel, "all_tied_weights_keys"):
+    _PreTrainedModel.all_tied_weights_keys = property(
+        lambda self: {k: k for k in (getattr(self, "_tied_weights_keys", None) or [])}
+    )
 
 from dllm_reason.models.base import DiffusionLM, DiffusionOutput
 from dllm_reason.utils.registry import MODEL_REGISTRY
 from dllm_reason.utils.logging import get_logger
 from dllm_reason.utils.local_resolve import resolve_model_path
+from dllm_reason.utils.llada_checkpoint_patch import ensure_llada_checkpoint_patched
 
 logger = get_logger(__name__)
 
@@ -43,13 +55,24 @@ class LLaDAWrapper(DiffusionLM):
         self,
         model_id: str = LLADA_HF_ID,
         max_seq_len: int = 1024,
-        torch_dtype: torch.dtype = torch.bfloat16,
+        torch_dtype: torch.dtype | None = None,
         device_map: str = "auto",
         trust_remote_code: bool = True,
         quantization_config=None,
+        dtype: torch.dtype | None = None,   # transformers >= 5.x name
     ):
+        # Accept both the legacy `torch_dtype` and the new `dtype` kwarg.
+        if dtype is None and torch_dtype is None:
+            dtype = torch.bfloat16
+        elif dtype is None:
+            dtype = torch_dtype
         # Resolve local checkpoint path before downloading from HuggingFace
         model_id = resolve_model_path(model_id)
+
+        # Self-heal the checkpoint's `modeling_llada.py` for transformers >= 5.x
+        # (idempotent; no-op if already patched or if we're loading directly
+        # from the HF hub without a local copy).
+        ensure_llada_checkpoint_patched(model_id)
 
         # Load tokenizer first to get vocab info
         logger.info(f"Loading tokenizer from {model_id}")
@@ -71,9 +94,10 @@ class LLaDAWrapper(DiffusionLM):
         self.tokenizer = tokenizer
         self.model_id = model_id
 
-        # Load the pretrained model
+        # Load the pretrained model.
+        # transformers >= 5.x uses `dtype=`; older versions used `torch_dtype=`.
         load_kwargs = dict(
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device_map=device_map,
             trust_remote_code=trust_remote_code,
         )
@@ -205,6 +229,12 @@ class LLaDAWrapper(DiffusionLM):
         else:
             text = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
             prompt_ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+        # transformers >= 5.x returns a BatchEncoding dict from apply_chat_template;
+        # older versions returned a bare Tensor. Normalize to Tensor.
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids.input_ids
+        elif isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+            prompt_ids = prompt_ids["input_ids"]
         prompt_len = prompt_ids.shape[1]
 
         # Append MASK tokens for generation

@@ -1,6 +1,6 @@
 # dLLM-Reason 功能手册（Feature Manual）
 
-> 版本：v1.5.0  |  最后更新：2026-04-09  |  语言：中文  |  English: [FEATURE_MANUAL.md](FEATURE_MANUAL.md)
+> 版本：v1.5.3  |  最后更新：2026-04-16  |  语言：中文  |  English: [FEATURE_MANUAL.md](FEATURE_MANUAL.md)
 
 
 ## 0. 项目定位
@@ -172,6 +172,13 @@ class DAGSearcher:
 种群初始化默认用 `build_all_templates(seq_len)` 作为 seeds。
 
 ### 5.1 搜索层级分类法
+
+> ⚠️ **2026-04 实证结果：** 在 GSM8K / LLaDA-8B 上，greedy、NAS supernet、
+> E2E differentiable 三种独立实现对 137 条失败题的 rescue rate 均为 **0%**。
+> 在 T=0、双向注意力下，unmask 顺序不携带可利用的信号。下述搜索基础设施
+> 保留以便后续架构复用，但主线工作已转向推理时超参搜索
+> （block_length × template × gen_length × temperature）。详见
+> [`docs/archive/finding_dag_search_zero_rescue.md`](archive/finding_dag_search_zero_rescue.md)（ZH 版同目录）。
 
 所有搜索方法按搜索空间大小组织为递增的层级体系。核心目标是找到离散扩散
 unmasking 的**最优生成顺序**。DAG 提供了一种可解释的结构，每个层级在逐步

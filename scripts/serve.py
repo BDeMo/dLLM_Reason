@@ -8,12 +8,14 @@ Usage:
     python scripts/serve.py --model_id checkpoints/llada-instruct --quantize 4bit
 
 API endpoints:
-    POST /generate        — generate text with a given strategy
-    POST /batch_generate  — batch generate (multiple prompts, single strategy)
-    POST /switch_model    — hot-swap the loaded model
-    GET  /strategies      — list available strategies
-    GET  /info            — model info (id, device, dtype)
-    GET  /health          — health check
+    POST /generate                  — generate text with a given strategy
+    POST /batch_generate            — batch generate (multiple prompts, single strategy)
+    POST /generate_span_revise      — A3: block denoise + sliding-window revise hook
+    POST /generate_block_schedule   — A4: explicit per-block (size, steps) schedule
+    POST /switch_model              — hot-swap the loaded model
+    GET  /strategies                — list available strategies
+    GET  /info                      — model info (id, device, dtype)
+    GET  /health                    — health check
 """
 
 import argparse
@@ -210,6 +212,125 @@ def batch_generate(req: BatchGenerateRequest):
             num_tokens=len(text.split()),
         ))
     return results
+
+
+# ── Validation-axis custom loops (A3 span-revise, A4 non-uniform blocks) ─────
+
+
+class SpanReviseRequest(BaseModel):
+    prompt: str
+    gen_length: int = Field(default=128, ge=1, le=2048)
+    steps: int = Field(default=128, ge=1, le=1024)
+    block_length: int = Field(default=32, ge=1, le=512)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    revise_every: int = Field(default=8, ge=0, le=1024)
+    revise_thresh: float = Field(default=0.4, ge=0.0, le=1.0)
+    window_size: int = Field(default=4, ge=1, le=64)
+
+
+@app.post("/generate_span_revise", response_model=GenerateResponse)
+def generate_span_revise_endpoint(req: SpanReviseRequest):
+    """A3 experiment: block-wise denoising + sliding-window mean-conf revise hook."""
+    if _model is None:
+        raise HTTPException(500, "Model not loaded")
+
+    from dllm_reason.inference.validation_ext import generate_span_revise
+
+    t0 = time.time()
+    text = generate_span_revise(
+        _model._llada, _model.tokenizer, req.prompt,
+        gen_length=req.gen_length, steps=req.steps,
+        block_length=req.block_length, temperature=req.temperature,
+        revise_every=req.revise_every, revise_thresh=req.revise_thresh,
+        window_size=req.window_size,
+        mask_id=_model.mask_token_id,
+    )
+    return GenerateResponse(
+        text=text,
+        strategy=f"span_revise(w={req.window_size},thr={req.revise_thresh},every={req.revise_every})",
+        elapsed_seconds=round(time.time() - t0, 3),
+        num_tokens=len(text.split()),
+    )
+
+
+class BlockScheduleRequest(BaseModel):
+    prompt: str
+    block_sizes: list[int] = Field(description="e.g. [16, 16, 16, 16, 64]")
+    steps_per_block: list[int] = Field(description="e.g. [16, 16, 16, 16, 64]")
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+
+@app.post("/generate_block_schedule", response_model=GenerateResponse)
+def generate_block_schedule_endpoint(req: BlockScheduleRequest):
+    """A4 experiment: explicit per-block (size, steps) schedule for non-uniform layouts."""
+    if _model is None:
+        raise HTTPException(500, "Model not loaded")
+    if len(req.block_sizes) != len(req.steps_per_block):
+        raise HTTPException(400, "block_sizes and steps_per_block must be same length")
+
+    from dllm_reason.inference.validation_ext import generate_block_schedule
+
+    t0 = time.time()
+    text = generate_block_schedule(
+        _model._llada, _model.tokenizer, req.prompt,
+        block_sizes=req.block_sizes,
+        steps_per_block=req.steps_per_block,
+        temperature=req.temperature,
+        mask_id=_model.mask_token_id,
+    )
+    return GenerateResponse(
+        text=text,
+        strategy=f"block_schedule({req.block_sizes})",
+        elapsed_seconds=round(time.time() - t0, 3),
+        num_tokens=len(text.split()),
+    )
+
+
+class InpaintAnchor(BaseModel):
+    start_pos: int = Field(ge=0, description="start position inside gen region")
+    text: str = Field(description="anchor text to pre-commit at this position")
+
+
+class InpaintRequest(BaseModel):
+    prompt: str
+    anchors: list[InpaintAnchor] = Field(
+        description="list of (start_pos, text) pairs; anchors are pre-committed "
+                    "inside the gen region, later ones override earlier ones on overlap"
+    )
+    gen_length: int = Field(default=128, ge=1, le=2048)
+    steps: int = Field(default=128, ge=1, le=1024)
+    block_length: int = Field(default=32, ge=1, le=512)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+
+@app.post("/generate_inpaint", response_model=GenerateResponse)
+def generate_inpaint_endpoint(req: InpaintRequest):
+    """Strategy-search: inpainting with anchor tokens pre-committed inside gen region.
+
+    Realises ``template_position`` ∈ {prefix, suffix, mid, scaffold} by placing
+    a template span at arbitrary positions in the generation region instead of
+    only at the prompt prefix. Supports pass@N via stochastic temperature.
+    """
+    if _model is None:
+        raise HTTPException(500, "Model not loaded")
+
+    from dllm_reason.inference.validation_ext import generate_inpaint
+
+    anchors = [(a.start_pos, a.text) for a in req.anchors]
+    t0 = time.time()
+    text = generate_inpaint(
+        _model._llada, _model.tokenizer, req.prompt,
+        anchors=anchors,
+        gen_length=req.gen_length, steps=req.steps,
+        block_length=req.block_length, temperature=req.temperature,
+        mask_id=_model.mask_token_id,
+    )
+    return GenerateResponse(
+        text=text,
+        strategy=f"inpaint(n_anchors={len(anchors)})",
+        elapsed_seconds=round(time.time() - t0, 3),
+        num_tokens=len(text.split()),
+    )
 
 
 # ── Model hot-swap ───────────────────────────────────────────────────────────

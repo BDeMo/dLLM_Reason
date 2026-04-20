@@ -1,4 +1,4 @@
-# Tutorial: dLLM-Reason v1.4.0 — Complete Usage Guide
+# Tutorial: dLLM-Reason v1.5.3 — Complete Usage Guide
 
 This guide covers every feature of dLLM-Reason: installation, evaluation,
 serving, Web UI, DAG search, and paper reproduction.
@@ -474,3 +474,75 @@ bash scripts/runs/search_nas.sh
 # === Generate tables ===
 python scripts/generate_latex_table.py results/*/summary.json --output table.tex
 ```
+
+---
+
+## 15. Troubleshooting Log
+
+### 2026-04-16 — `transformers >= 5.x` compatibility patches for LLaDA
+
+**Symptom:** `python scripts/serve.py --model_id GSAI-ML/LLaDA-8B-Instruct` fails
+during model load with one of three cascading errors, depending on how far
+loading proceeds:
+
+```
+1. AttributeError: 'LLaDAModelLM' object has no attribute 'all_tied_weights_keys'.
+                   Did you mean: '_tied_weights_keys'?
+2. AttributeError: 'list' object has no attribute 'keys'
+3. TypeError: LLaDAModelLM.tie_weights() got an unexpected keyword argument 'missing_keys'
+```
+
+**Root cause:** `transformers 5.5.3` renamed the legacy `_tied_weights_keys`
+(list of strings) to `all_tied_weights_keys` (dict mapping tied-key → source-key),
+and added new kwargs `missing_keys=..., recompute_mapping=...` to `tie_weights()`.
+LLaDA's remote modeling code predates these changes and exposes only the
+legacy API.
+
+**Fix** — three small patches, no env downgrade required:
+
+1. **Compat shim for `all_tied_weights_keys`** — prepended to
+   [src/dllm_reason/models/llada.py](../src/dllm_reason/models/llada.py):
+
+   ```python
+   from transformers import PreTrainedModel as _PreTrainedModel
+   if not hasattr(_PreTrainedModel, "all_tied_weights_keys"):
+       _PreTrainedModel.all_tied_weights_keys = property(
+           lambda self: {k: k for k in (getattr(self, "_tied_weights_keys", None) or [])}
+       )
+   ```
+
+2. **Tolerant `tie_weights` signature** — in the local LLaDA checkpoint's
+   `modeling_llada.py` (both `checkpoints/llada-instruct/` and
+   `checkpoints/llada-base/`, and if loaded via HF hub, in
+   `~/.cache/huggingface/modules/transformers_modules/llada_*/modeling_llada.py`):
+
+   ```python
+   # Before
+   def tie_weights(self):
+   # After
+   def tie_weights(self, *args, **kwargs):
+       # Accept & ignore transformers >= 5.x kwargs.
+   ```
+
+3. **Clear HF dynamic module cache** so the updated `modeling_llada.py` is
+   re-copied into the HF internal cache:
+
+   ```bash
+   rm -rf ~/.cache/huggingface/modules/transformers_modules/llada_hyphen_instruct
+   ```
+
+**Verification:**
+
+```bash
+$ python scripts/serve.py --model_id GSAI-ML/LLaDA-8B-Instruct
+[...] LLaDA model loaded.
+[...] mask_token_id=126336 ('<|mdm_mask|>') — from model.config
+Model loaded on cuda:0, serving at 0.0.0.0:8000
+INFO:     Uvicorn running on http://0.0.0.0:8000
+
+$ curl -s http://localhost:8000/health
+{"status":"ok","model":"GSAI-ML/LLaDA-8B-Instruct","device":"cuda:0"}
+```
+
+**If you pull a fresh LLaDA checkpoint** that hasn't been patched: re-apply
+step 2 on the new `modeling_llada.py`, or upstream the fix to `GSAI-ML/LLaDA-*`.
