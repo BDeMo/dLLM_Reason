@@ -24,6 +24,15 @@
 #   bash scripts/run_v1.6.sh --dry_run
 #   bash scripts/run_v1.6.sh --check_only
 #
+# Resuming:
+#   --resume_t6_run_dir PATH   Reuse an existing t6_teacher_trace_* dir.
+#     If its t6_sft.jsonl already aggregated, Phase 1a is skipped
+#     entirely. Otherwise Phase 1a resumes per-prompt work in that dir
+#     (shards / single-GPU both honour).
+#   --force_retrain_t6         Re-train T6 SFT even if
+#     runs/training/v16_t6/hf/config.json already exists. Default
+#     behaviour is to SKIP SFT once a trained HF ckpt is produced.
+#
 # Scope change from earlier drafts:
 #   v1.6 is T6-ONLY (canvas distill from AR teacher). T7 (self-distill)
 #   moved to a future release. Pass --include_t7 to opt back in.
@@ -62,6 +71,8 @@ SKIP_QWEN=0
 SKIP_GSM8K=0
 T6_GPUS=1                       # single GPU default; set --t6_gpus 8 for shards
 INCLUDE_T7=0                    # explicit opt-in to legacy T7 phase
+RESUME_T6_RUN_DIR=""            # reuse existing t6_teacher_trace_* dir
+FORCE_RETRAIN_T6=0              # re-train SFT even if ckpt exists
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -84,6 +95,8 @@ while [[ $# -gt 0 ]]; do
         --smoke)          SMOKE=1;             shift ;;
         --t6_gpus)        T6_GPUS="$2";        shift 2 ;;
         --include_t7)     INCLUDE_T7=1; TO_PHASE=4; shift ;;
+        --resume_t6_run_dir) RESUME_T6_RUN_DIR="$2"; shift 2 ;;
+        --force_retrain_t6)  FORCE_RETRAIN_T6=1; shift ;;
         -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "[V1.6] unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -263,41 +276,79 @@ phase_0() {
 phase_1() {
     hdr "Phase 1 — T6 canvas distill (AR-teacher, main contribution)"
 
-    # 1a: teacher trace generation (local Qwen3.5-4B)
-    # Single-GPU path vs multi-GPU shard orchestrator
-    if [[ "$T6_GPUS" -gt 1 ]]; then
-        run_or_dry "T6 teacher trace generation ($T6_GPUS-GPU shard)" \
-            bash scripts/run_t6_shards.sh \
-            --gpus "$T6_GPUS" \
-            --max_train "$MAX_TRAIN" \
-            --teacher_ckpt "$TEACHER_CKPT" \
-            --retries "$T6_RETRIES" \
-            --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k
-    else
-        run_or_dry "T6 teacher trace generation (single-GPU)" \
-            python scripts/validate/t6_teacher_trace.py \
-            --scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k \
-            --n "$MAX_TRAIN" \
-            --teacher local --local_model "$TEACHER_CKPT" \
-            --retries_per_prompt "$T6_RETRIES" \
-            --max_tokens 800 --temperature 0.0
+    # ── 1a: Teacher trace generation ────────────────────────────────────────
+    # Detect whether we already have (enough of) a teacher trace run to reuse.
+    local need_trace=1
+    local existing_jsonl=""
+
+    if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
+        # User explicitly asked to resume a specific run dir
+        if [[ -f "$RESUME_T6_RUN_DIR/t6_sft.jsonl" ]]; then
+            echo "[PHASE 1] --resume_t6_run_dir: reusing complete trace at $RESUME_T6_RUN_DIR"
+            T6_RUN_DIR="$RESUME_T6_RUN_DIR"
+            T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+            existing_jsonl="$T6_SFT_JSONL"
+            need_trace=0
+        else
+            echo "[PHASE 1] --resume_t6_run_dir: partial run, resuming shard work"
+            T6_RUN_DIR="$RESUME_T6_RUN_DIR"
+            # need_trace still 1, but we'll pass --run_dir to reuse per_prompt/*
+        fi
     fi
 
-    # Resolve latest T6 run dir
-    T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
-    T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+    if [[ "$need_trace" -eq 1 ]]; then
+        # Single-GPU path vs multi-GPU shard orchestrator
+        if [[ "$T6_GPUS" -gt 1 ]]; then
+            local rt6_args=(--gpus "$T6_GPUS"
+                            --max_train "$MAX_TRAIN"
+                            --teacher_ckpt "$TEACHER_CKPT"
+                            --retries "$T6_RETRIES"
+                            --scope_path "$GSM8K_TRAIN_JSON"
+                            --scope_group gsm8k)
+            if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
+                rt6_args+=(--run_dir "$RESUME_T6_RUN_DIR")
+            fi
+            run_or_dry "T6 teacher trace generation ($T6_GPUS-GPU shard)" \
+                bash scripts/run_t6_shards.sh "${rt6_args[@]}"
+        else
+            local tt_args=(--scope_path "$GSM8K_TRAIN_JSON" --scope_group gsm8k
+                           --n "$MAX_TRAIN"
+                           --teacher local --local_model "$TEACHER_CKPT"
+                           --retries_per_prompt "$T6_RETRIES"
+                           --max_tokens 800 --temperature 0.0)
+            if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
+                tt_args+=(--run_dir "$RESUME_T6_RUN_DIR" --resume)
+            fi
+            run_or_dry "T6 teacher trace generation (single-GPU)" \
+                python scripts/validate/t6_teacher_trace.py "${tt_args[@]}"
+        fi
 
-    # 1b: T6 SFT from LLaDA baseline (NOT warm-starting from T7 anymore)
-    run_or_dry "T6 SFT (from LLaDA baseline)" \
-        python scripts/validate/t6t7_train.py \
-        --jsonl_path "$T6_SFT_JSONL" \
-        --run_name v16_t6 \
-        --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
-        --max_steps "$T6_MAX_STEPS" \
-        --batch_size "$BATCH_SIZE" --grad_accum_steps "$GRAD_ACCUM" \
-        --lr 2e-5
+        # Resolve T6 run dir: use the one we told it to use, else latest
+        if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
+            T6_RUN_DIR="$RESUME_T6_RUN_DIR"
+        else
+            T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
+        fi
+        T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+    fi
 
-    # 1c: verify
+    # ── 1b: T6 SFT (skip if ckpt already produced) ──────────────────────────
+    local ckpt_hf_config="$T6_CKPT_DIR/hf/config.json"
+    if [[ -f "$ckpt_hf_config" ]] && [[ "$FORCE_RETRAIN_T6" -eq 0 ]]; then
+        echo "[PHASE 1] T6 SFT ckpt already exists at $T6_CKPT_DIR/hf"
+        echo "          skipping training; pass --force_retrain_t6 to re-run"
+    else
+        run_or_dry "T6 SFT (from LLaDA baseline)" \
+            python scripts/validate/t6t7_train.py \
+            --jsonl_path "$T6_SFT_JSONL" \
+            --run_name v16_t6 \
+            --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
+            --max_steps "$T6_MAX_STEPS" \
+            --batch_size "$BATCH_SIZE" --grad_accum_steps "$GRAD_ACCUM" \
+            --lr 2e-5
+    fi
+
+    # ── 1c: verify ──────────────────────────────────────────────────────────
     echo
     echo "[CHECK Phase 1 outputs]"
     local ok=1
