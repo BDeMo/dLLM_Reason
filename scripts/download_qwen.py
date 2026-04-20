@@ -73,17 +73,26 @@ def apply_mirror(mirror: str | None) -> str:
 # and *-Base variants; the Instruct variant is usually what we want for T6
 # teacher (follows the <SETUP>/<STEP_x>/<ANSWER> format instruction).
 CANDIDATES = {
-    # Qwen3.5 family (target of v1.6 T6 teacher)
-    "3.5-4B":    "Qwen/Qwen3.5-4B-Instruct",
-    "3.5-9B":    "Qwen/Qwen3.5-9B-Instruct",
-    "3.5-27B":   "Qwen/Qwen3.5-27B-Instruct",
-    # Qwen3 family (likely fallback if Qwen3.5 repos not yet up)
+    # Qwen3.5 small (v1.6 T6 teacher candidates) — IDs verified on HF 2026-04-19.
+    # No '-Instruct' suffix: the default repo IS the chat/instruct model;
+    # '-Base' suffix is the pre-chat checkpoint.
+    "3.5-0.8B":  "Qwen/Qwen3.5-0.8B",
+    "3.5-2B":    "Qwen/Qwen3.5-2B",
+    "3.5-4B":    "Qwen/Qwen3.5-4B",
+    "3.5-9B":    "Qwen/Qwen3.5-9B",
+    # Qwen3.5 medium (MoE + large dense)
+    "3.5-27B":   "Qwen/Qwen3.5-27B",
+    "3.5-35B":   "Qwen/Qwen3.5-35B-A3B",       # MoE, 3B activated
+    "3.5-122B":  "Qwen/Qwen3.5-122B-A10B",     # MoE, 10B activated
+    # Base variants (if you want non-chat pretrained)
+    "3.5-4B-base":  "Qwen/Qwen3.5-4B-Base",
+    "3.5-9B-base":  "Qwen/Qwen3.5-9B-Base",
+    # Earlier families (fallback)
     "3-4B":      "Qwen/Qwen3-4B",
     "3-8B":      "Qwen/Qwen3-8B",
     "3-14B":     "Qwen/Qwen3-14B",
     "3-30B":     "Qwen/Qwen3-30B-A3B",
     "3-32B":     "Qwen/Qwen3-32B",
-    # Qwen2.5 family (further fallback)
     "2.5-7B":    "Qwen/Qwen2.5-7B-Instruct",
     "2.5-32B":   "Qwen/Qwen2.5-32B-Instruct",
     "2.5-72B":   "Qwen/Qwen2.5-72B-Instruct",

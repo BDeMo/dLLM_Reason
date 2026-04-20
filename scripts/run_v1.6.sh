@@ -78,7 +78,18 @@ T6_CKPT_DIR="$ROOT/runs/training/v16_t6_stage2"
 EVAL_DIR="$ROOT/runs/validation/v16_eval"
 
 if [[ -z "$TEACHER_CKPT" ]]; then
-    TEACHER_CKPT="$ROOT/checkpoints/Qwen__Qwen${TEACHER_SIZE}-Instruct"
+    # Qwen3.5 repos have NO '-Instruct' suffix (verified on HF 2026-04-19);
+    # the default snapshot IS the chat model. Resolve via download_qwen.py's
+    # CANDIDATES mapping by asking it to dry-print the plan.
+    RESOLVED=$(python scripts/download_qwen.py --sizes "$TEACHER_SIZE" --dry_run 2>&1 \
+                 | grep -oE 'checkpoints[\\/]+[A-Za-z0-9._]+[-\._A-Za-z0-9]*' \
+                 | head -1)
+    if [[ -n "$RESOLVED" ]]; then
+        TEACHER_CKPT="$ROOT/${RESOLVED//\\//}"   # normalise any backslashes on win
+    else
+        # Fallback: naive construction for sizes like "3.5-4B" → Qwen3.5-4B
+        TEACHER_CKPT="$ROOT/checkpoints/Qwen__Qwen${TEACHER_SIZE}"
+    fi
 fi
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
