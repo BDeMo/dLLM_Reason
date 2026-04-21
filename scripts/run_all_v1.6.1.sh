@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# run_all_v1.6.1.sh — End-to-end v1.6.1 pipeline, one command.
+#
+# Pipeline:
+#   0. Download Qwen teacher + gsm8k train  (idempotent: resume if present)
+#   1. Start a single-GPU LLaDA serve for scope regen + T7/eval HTTP
+#   2. Regenerate scope_fail_prompts.json + scope_ok_prompts.json from
+#      gsm8k test under CANONICAL config (T=0, bl=32, g=128)
+#   3. T6 teacher trace on gsm8k TRAIN (multi-GPU shard, multi-output
+#      collection: diverse valid traces per prompt under T>0)
+#   4. T6 SFT on the (auto-cleaned) t6_sft.jsonl
+#   5. Eval baseline vs T6-trained on the FRESH scope (canonical config)
+#   6. Archive stub in docs/archive/
+#
+# Designed for a single overnight / multi-hour run on 8×A100. Every
+# phase is idempotent and resume-safe; re-running after an interruption
+# picks up where it stopped.
+#
+# Usage:
+#   bash scripts/run_all_v1.6.1.sh
+#   bash scripts/run_all_v1.6.1.sh --mirror hf-mirror
+#   bash scripts/run_all_v1.6.1.sh --teacher_size 3-8B --max_train 2000
+#   bash scripts/run_all_v1.6.1.sh --from_phase 3   # skip downloads / scope
+#   bash scripts/run_all_v1.6.1.sh --dry_run
+#
+# Defaults target the "big run" profile the user described:
+#   - Qwen3-8B teacher (compatible with stable transformers 4.x)
+#   - 2000 gsm8k train prompts
+#   - Multi-output teacher (retries=5, temperature=0.7) → diverse traces
+#   - 8-GPU shard for teacher trace gen
+#   - Single-GPU SFT (LLaDA-8B fits A100-80GB at bs=4)
+
+set -euo pipefail
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MIRROR="default"
+TEACHER_SIZE="3-8B"                # Qwen3-8B (no transformers 5 required)
+TEACHER_CKPT=""                    # auto from TEACHER_SIZE
+MAX_TRAIN=2000
+MAX_SCOPE_PROMPTS=""               # "" = full gsm8k test (1319)
+T6_GPUS=8
+T6_BATCH_SIZE=8
+T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
+T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
+T6_MAX_STEPS=2000
+T6_BATCH_SIZE_SFT=4
+T6_GRAD_ACCUM=4
+T6_LR=2e-5
+EVAL_GEN_LENGTH=128                # MUST match scope canonical
+EVAL_BLOCK_LENGTH=32
+EVAL_TEMPERATURE=0
+SERVER_PORT=8000
+FROM_PHASE=0
+TO_PHASE=6
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mirror)             MIRROR="$2"; shift 2 ;;
+        --teacher_size)       TEACHER_SIZE="$2"; shift 2 ;;
+        --teacher_ckpt)       TEACHER_CKPT="$2"; shift 2 ;;
+        --max_train)          MAX_TRAIN="$2"; shift 2 ;;
+        --max_scope_prompts)  MAX_SCOPE_PROMPTS="$2"; shift 2 ;;
+        --t6_gpus)            T6_GPUS="$2"; shift 2 ;;
+        --t6_batch_size)      T6_BATCH_SIZE="$2"; shift 2 ;;
+        --t6_retries)         T6_RETRIES="$2"; shift 2 ;;
+        --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
+        --t6_max_steps)       T6_MAX_STEPS="$2"; shift 2 ;;
+        --t6_lr)              T6_LR="$2"; shift 2 ;;
+        --server_port)        SERVER_PORT="$2"; shift 2 ;;
+        --from_phase)         FROM_PHASE="$2"; shift 2 ;;
+        --to_phase)           TO_PHASE="$2"; shift 2 ;;
+        --dry_run)            DRY_RUN=1; shift ;;
+        -h|--help)            grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)                    echo "[ALL] unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+[[ -z "$TEACHER_CKPT" ]] && \
+    TEACHER_CKPT="$ROOT/checkpoints/Qwen__Qwen${TEACHER_SIZE}"
+
+GSM8K_TRAIN="$ROOT/runs/validation/gsm8k_train_prompts.json"
+SCOPE_FAIL="$ROOT/runs/validation/scope_fail_prompts.json"
+SCOPE_OK="$ROOT/runs/validation/scope_ok_prompts.json"
+T6_CKPT_DIR="$ROOT/runs/training/v161_t6"
+SERVER_URL="http://127.0.0.1:$SERVER_PORT"
+
+hdr() {
+    echo
+    echo "══════════════════════════════════════════════════════════════"
+    echo "  $1"
+    echo "══════════════════════════════════════════════════════════════"
+}
+
+run_or_dry() {
+    local desc="$1"; shift
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY] $desc"
+        echo "      $*"
+        return 0
+    fi
+    echo "[RUN] $desc"
+    echo "      $*"
+    eval "$@"
+}
+
+check_file() {
+    local p="$1" desc="$2" min="${3:-1}"
+    if [[ ! -f "$p" ]]; then
+        echo "  ✗ missing: $desc ($p)"; return 1
+    fi
+    local sz
+    sz=$(stat -c%s "$p" 2>/dev/null || stat -f%z "$p" 2>/dev/null || echo 0)
+    if [[ "$sz" -lt "$min" ]]; then
+        echo "  ✗ too small ($sz < $min): $desc"; return 1
+    fi
+    echo "  ✓ $desc ($sz bytes)"; return 0
+}
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+hdr "v1.6.1 Pipeline — Run All"
+cat <<EOF
+  ROOT              = $ROOT
+  MIRROR            = $MIRROR
+  TEACHER_SIZE      = $TEACHER_SIZE
+  TEACHER_CKPT      = $TEACHER_CKPT
+  MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
+  MAX_SCOPE         = ${MAX_SCOPE_PROMPTS:-"all 1319"} (gsm8k test, for scope regen)
+  T6_GPUS           = $T6_GPUS
+  T6_BATCH_SIZE     = $T6_BATCH_SIZE  (HF pipeline batching per shard)
+  T6_RETRIES        = $T6_RETRIES  (v1.6.1: multi-output via T>0 + retries)
+  T6_TEMPERATURE    = $T6_TEMPERATURE  (v1.6.1: >0 for diversity)
+  T6_MAX_STEPS      = $T6_MAX_STEPS
+  EVAL config       = T=$EVAL_TEMPERATURE  bl=$EVAL_BLOCK_LENGTH  g=$EVAL_GEN_LENGTH  (canonical)
+  SERVER_URL        = $SERVER_URL
+  PHASES            = $FROM_PHASE ... $TO_PHASE
+  DRY_RUN           = $DRY_RUN
+EOF
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 0 — Downloads
+# ═════════════════════════════════════════════════════════════════════════════
+phase_0() {
+    hdr "Phase 0 — Downloads (Qwen + gsm8k train)"
+    run_or_dry "Download Qwen teacher ($TEACHER_SIZE)" \
+        python scripts/download_qwen.py \
+        --sizes "$TEACHER_SIZE" --mirror "$MIRROR"
+    run_or_dry "Load gsm8k train prompts (max $MAX_TRAIN)" \
+        python scripts/validate/load_gsm8k_train.py \
+        --mirror "$MIRROR" --max_samples "$MAX_TRAIN"
+
+    echo
+    echo "[CHECK Phase 0]"
+    local ok=1
+    python scripts/download_qwen.py --sizes "$TEACHER_SIZE" --check_only \
+        --min_weights_gb 1.0 || ok=0
+    check_file "$GSM8K_TRAIN" "gsm8k train" 1000 || ok=0
+    [[ "$ok" -eq 1 ]] || { echo "[PHASE 0] ✗ FAIL"; exit 1; }
+    echo "[PHASE 0] ✓ PASS"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 1 — Start LLaDA serve (for scope regen + eval)
+# ═════════════════════════════════════════════════════════════════════════════
+SERVE_PID=""
+cleanup_serve() {
+    if [[ -n "$SERVE_PID" ]]; then
+        echo "[ALL] cleanup: kill serve pid $SERVE_PID"
+        kill "$SERVE_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_serve EXIT INT TERM
+
+phase_1() {
+    hdr "Phase 1 — Start LLaDA serve on port $SERVER_PORT"
+
+    # Reuse if already up
+    if curl -sf "$SERVER_URL/health" > /dev/null 2>&1; then
+        echo "[PHASE 1] serve already running at $SERVER_URL, reusing"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY] would launch: CUDA_VISIBLE_DEVICES=0 python scripts/serve.py --port $SERVER_PORT"
+        return 0
+    fi
+
+    mkdir -p tmp
+    CUDA_VISIBLE_DEVICES=0 nohup python scripts/serve.py \
+        --model_id GSAI-ML/LLaDA-8B-Instruct \
+        --port "$SERVER_PORT" --host 127.0.0.1 \
+        > tmp/v161_serve.log 2>&1 &
+    SERVE_PID=$!
+    echo "[PHASE 1] serve pid=$SERVE_PID, log=tmp/v161_serve.log"
+
+    local waited=0
+    until curl -sf "$SERVER_URL/health" > /dev/null 2>&1; do
+        sleep 5; waited=$((waited + 5))
+        if [[ "$waited" -ge 600 ]]; then
+            echo "[PHASE 1] ✗ serve not ready after 10 min"; exit 1
+        fi
+    done
+    echo "[PHASE 1] ✓ serve ready after ${waited}s"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 2 — Regenerate scope_fail + scope_ok from gsm8k test
+# ═════════════════════════════════════════════════════════════════════════════
+phase_2() {
+    hdr "Phase 2 — Regenerate scope (baseline canonical eval on gsm8k test)"
+
+    local regen_args=(
+        --server_url "$SERVER_URL"
+        --mirror "$MIRROR"
+        --gen_length 128
+        --block_length 32
+        --temperature 0
+    )
+    [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
+        regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
+
+    run_or_dry "Regenerate scope (gsm8k test → scope_fail/ok)" \
+        python scripts/validate/regen_scope.py "${regen_args[@]}"
+
+    echo
+    echo "[CHECK Phase 2]"
+    local ok=1
+    check_file "$SCOPE_FAIL" "scope_fail" 500 || ok=0
+    check_file "$SCOPE_OK"   "scope_ok"   500 || ok=0
+    [[ "$ok" -eq 1 ]] || { echo "[PHASE 2] ✗ FAIL"; exit 1; }
+    echo "[PHASE 2] ✓ PASS"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 3 — T6 teacher trace (multi-GPU, multi-output)
+# ═════════════════════════════════════════════════════════════════════════════
+phase_3() {
+    hdr "Phase 3 — T6 teacher trace ($T6_GPUS GPU, T=$T6_TEMPERATURE, retries=$T6_RETRIES)"
+
+    local rt6_args=(
+        --gpus "$T6_GPUS"
+        --max_train "$MAX_TRAIN"
+        --teacher_ckpt "$TEACHER_CKPT"
+        --retries "$T6_RETRIES"
+        --batch_size "$T6_BATCH_SIZE"
+        --scope_path "$GSM8K_TRAIN"
+        --scope_group gsm8k
+    )
+    run_or_dry "T6 teacher trace ($T6_GPUS-GPU shard)" \
+        bash scripts/run_t6_shards.sh "${rt6_args[@]}"
+
+    # Resolve the most recent t6_teacher_trace dir for the SFT phase
+    T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
+    T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+
+    echo
+    echo "[CHECK Phase 3]"
+    local ok=1
+    check_file "$T6_SFT_JSONL" "t6_sft.jsonl" 100 || ok=0
+    [[ "$ok" -eq 1 ]] || { echo "[PHASE 3] ✗ FAIL"; exit 1; }
+    echo "[PHASE 3] ✓ PASS  (run dir: $T6_RUN_DIR)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 4 — T6 SFT (single-GPU, skip if ckpt exists)
+# ═════════════════════════════════════════════════════════════════════════════
+phase_4() {
+    hdr "Phase 4 — T6 SFT ($T6_MAX_STEPS steps, bs=$T6_BATCH_SIZE_SFT × accum $T6_GRAD_ACCUM)"
+
+    # Resolve T6 JSONL (may have been set by Phase 3 or by --from_phase 4)
+    if [[ -z "${T6_SFT_JSONL:-}" ]]; then
+        T6_RUN_DIR=$(ls -dt "$ROOT"/runs/validation/t6_teacher_trace_* 2>/dev/null | head -1)
+        T6_SFT_JSONL="$T6_RUN_DIR/t6_sft.jsonl"
+    fi
+
+    if [[ -f "$T6_CKPT_DIR/hf/config.json" ]]; then
+        echo "[PHASE 4] T6 ckpt exists at $T6_CKPT_DIR/hf; skipping SFT"
+    else
+        run_or_dry "T6 SFT" \
+            python scripts/validate/t6t7_train.py \
+            --jsonl_path "$T6_SFT_JSONL" \
+            --run_name v161_t6 \
+            --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
+            --max_steps "$T6_MAX_STEPS" \
+            --batch_size "$T6_BATCH_SIZE_SFT" --grad_accum_steps "$T6_GRAD_ACCUM" \
+            --lr "$T6_LR" \
+            --max_seq_len 768
+    fi
+
+    echo
+    echo "[CHECK Phase 4]"
+    if [[ -d "$T6_CKPT_DIR/hf" ]]; then
+        echo "  ✓ T6 ckpt ($T6_CKPT_DIR/hf)"
+        echo "[PHASE 4] ✓ PASS"
+    else
+        echo "  ✗ missing T6 ckpt dir"; echo "[PHASE 4] ✗ FAIL"; exit 1
+    fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 5 — Eval baseline vs T6 (canonical config)
+# ═════════════════════════════════════════════════════════════════════════════
+phase_5() {
+    hdr "Phase 5 — Eval baseline vs T6 (canonical config g=$EVAL_GEN_LENGTH)"
+
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    local EVAL_DIR="$ROOT/runs/validation/v161_eval_${ts}"
+
+    local eval_args=(
+        --out_dir "$EVAL_DIR"
+        --gen_length "$EVAL_GEN_LENGTH"
+        --block_length "$EVAL_BLOCK_LENGTH"
+        --temperature "$EVAL_TEMPERATURE"
+        --ckpts "baseline=GSAI-ML/LLaDA-8B-Instruct"
+    )
+    [[ -d "$T6_CKPT_DIR/hf" ]] && eval_args+=("t6=$T6_CKPT_DIR/hf")
+
+    run_or_dry "v1.6.1 eval" \
+        python scripts/validate/v16_eval.py "${eval_args[@]}"
+
+    echo
+    echo "[CHECK Phase 5]"
+    check_file "$EVAL_DIR/comparison.md" "comparison.md" 50 && \
+        echo "[PHASE 5] ✓ PASS (see $EVAL_DIR/comparison.md)" || \
+        { echo "[PHASE 5] ✗ FAIL"; exit 1; }
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 6 — Archive stub
+# ═════════════════════════════════════════════════════════════════════════════
+phase_6() {
+    hdr "Phase 6 — Archive stub to docs/archive/"
+
+    local latest_eval
+    latest_eval=$(ls -dt "$ROOT"/runs/validation/v161_eval_* 2>/dev/null | head -1)
+    if [[ -z "$latest_eval" ]]; then
+        echo "[PHASE 6] skip: no v161_eval_* dir"; return
+    fi
+
+    local archive_doc="$ROOT/docs/archive/finding_v1.6.1_canvas_distill.zh.md"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY] would write archive stub from $latest_eval"
+        return
+    fi
+    mkdir -p "$(dirname "$archive_doc")"
+    cat > "$archive_doc" <<EOF
+# Finding v1.6.1 — Canvas Distill (multi-output teacher)
+
+**日期**：$(date +%Y-%m-%d)
+**前置 plan**：\`docs/plans/2026-04-19_v1.6_plan.zh.md\`
+**Eval run**：\`${latest_eval#$ROOT/}\`
+
+## 数字
+
+\`\`\`
+$(cat "$latest_eval/comparison.md" 2>/dev/null || echo '(comparison.md missing)')
+\`\`\`
+
+## 配置
+
+- Teacher: \`$TEACHER_CKPT\`
+- MAX_TRAIN: $MAX_TRAIN
+- T6 retries=$T6_RETRIES  temperature=$T6_TEMPERATURE  (multi-output)
+- SFT steps=$T6_MAX_STEPS  lr=$T6_LR
+- Eval: g=$EVAL_GEN_LENGTH  bl=$EVAL_BLOCK_LENGTH  T=$EVAL_TEMPERATURE
+
+## 结论
+
+TODO: fill in after reviewing numbers
+EOF
+    echo "[PHASE 6] stub → $archive_doc"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Main
+# ═════════════════════════════════════════════════════════════════════════════
+[[ "$FROM_PHASE" -le 0 && "$TO_PHASE" -ge 0 ]] && phase_0
+[[ "$FROM_PHASE" -le 1 && "$TO_PHASE" -ge 1 ]] && phase_1
+[[ "$FROM_PHASE" -le 2 && "$TO_PHASE" -ge 2 ]] && phase_2
+[[ "$FROM_PHASE" -le 3 && "$TO_PHASE" -ge 3 ]] && phase_3
+[[ "$FROM_PHASE" -le 4 && "$TO_PHASE" -ge 4 ]] && phase_4
+[[ "$FROM_PHASE" -le 5 && "$TO_PHASE" -ge 5 ]] && phase_5
+[[ "$FROM_PHASE" -le 6 && "$TO_PHASE" -ge 6 ]] && phase_6
+
+hdr "v1.6.1 pipeline done"

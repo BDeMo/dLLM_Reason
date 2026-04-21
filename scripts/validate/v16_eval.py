@@ -69,14 +69,33 @@ def eval_ckpt(ckpt_path: str, out_dir: Path, label: str,
     _lazy_imports()
     print(f"[EVAL] {label}  →  {ckpt_path}")
     print(f"[EVAL] loading model ...")
-    model = LLaDAWrapper(model_id=ckpt_path, max_seq_len=512)
-    model.model.eval() if hasattr(model, "model") else None
+    # max_seq_len needs room for prompt + gen_length
+    model = LLaDAWrapper(model_id=ckpt_path, max_seq_len=max(512, gen_length + 256))
+    # LLaDAWrapper wraps HF model as self._llada; set eval mode on the inner
+    # model. Calling .eval() on the wrapper itself also cascades to submodules
+    # via nn.Module semantics.
+    model.eval()
 
     fails = json.loads(SCOPE_FAIL.read_text(encoding="utf-8"))
     oks = json.loads(SCOPE_OK.read_text(encoding="utf-8"))
     results = {"fail": [], "ok": []}
 
     max_new = max_new_tokens or gen_length
+
+    # Sanity check: one generate() call before the main loop so we fail loud
+    # if signature / setup is broken (previously silently swallowed exceptions
+    # and returned empty strings for every prompt).
+    print(f"[EVAL] sanity check: single generate on 'What is 2+2?' ...")
+    try:
+        sanity_out = model.generate(
+            "What is 2+2?",
+            generation_len=32, block_length=32, num_steps=32,
+            temperature=0.0, remasking="low_confidence",
+        )
+        print(f"[EVAL] sanity ✓ ({len(sanity_out)} chars returned)")
+    except Exception as e:
+        print(f"[EVAL] FATAL sanity failure: {e!r}", file=sys.stderr)
+        raise
 
     for group, prompts in [("fail", fails), ("ok", oks)]:
         pp_dir = out_dir / "per_prompt"
@@ -87,16 +106,26 @@ def eval_ckpt(ckpt_path: str, out_dir: Path, label: str,
             gt = rec.get("ground_truth") or rec.get("gt")
             t0 = time.time()
             try:
+                # LLaDAWrapper.generate signature: generation_len (not
+                # max_new_tokens), remasking (not strategy); prior v1.6
+                # draft used FastAPI-style kwargs which silently broke.
                 out = model.generate(
                     prompt,
-                    strategy="confidence",
-                    max_new_tokens=max_new,
+                    generation_len=max_new,
                     num_steps=max_new,
                     block_length=block_length,
                     temperature=temperature,
+                    remasking="low_confidence",
                 )
             except Exception as e:
-                print(f"[EVAL] WARN {group}_{i}: {e}")
+                # Fail fast on the very first per-prompt error: previously
+                # repeated exceptions produced an all-zero comparison.md
+                # that looked like model failure rather than eval bug.
+                if group == "fail" and i == 0:
+                    print(f"[EVAL] FATAL first-prompt failure: {e!r}",
+                          file=sys.stderr)
+                    raise
+                print(f"[EVAL] WARN {group}_{i}: {e!r}")
                 out = ""
             dt = time.time() - t0
             correct = bool(is_correct(out, gt))
@@ -183,9 +212,20 @@ def main():
     ap.add_argument("--label", type=str, default="ckpt")
     ap.add_argument("--ckpts", type=str, nargs="+", default=None,
                     help="multiple ckpts in 'label=path' form")
-    ap.add_argument("--gen_length", type=int, default=192)
-    ap.add_argument("--block_length", type=int, default=32)
-    ap.add_argument("--temperature", type=float, default=0.0)
+    # Canonical eval config — MUST match scope_fail/scope_ok creation config.
+    # Source: docs/archive/ablation_index.zh.md § Setting & Definitions:
+    #   T=0, block_length=32, gen_length=128, remasking=low_confidence
+    # scope_fail_prompts.json items all have num_steps=128, block_length=32.
+    # Using any other config breaks the fail/ok labeling contract — e.g.
+    # gen_length=192 was observed to make baseline 'solve' 39/60 fail
+    # prompts (matches A6's per-length report) purely from the longer
+    # canvas, not from model capability change.
+    ap.add_argument("--gen_length", type=int, default=128,
+                    help="MUST match scope creation config (default 128).")
+    ap.add_argument("--block_length", type=int, default=32,
+                    help="MUST match scope creation config (default 32).")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="MUST match scope creation config (default 0).")
     ap.add_argument("--out_dir", type=str, default=None,
                     help="default: runs/validation/v16_eval_<ts>")
     args = ap.parse_args()

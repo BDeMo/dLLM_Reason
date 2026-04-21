@@ -70,6 +70,7 @@ SMOKE=0
 SKIP_QWEN=0
 SKIP_GSM8K=0
 T6_GPUS=1                       # single GPU default; set --t6_gpus 8 for shards
+T6_BATCH_SIZE=4                 # HF pipeline batch size (1 = serial, no batching)
 INCLUDE_T7=0                    # explicit opt-in to legacy T7 phase
 RESUME_T6_RUN_DIR=""            # reuse existing t6_teacher_trace_* dir
 FORCE_RETRAIN_T6=0              # re-train SFT even if ckpt exists
@@ -94,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --skip_gsm8k)     SKIP_GSM8K=1;        shift ;;
         --smoke)          SMOKE=1;             shift ;;
         --t6_gpus)        T6_GPUS="$2";        shift 2 ;;
+        --t6_batch_size)  T6_BATCH_SIZE="$2";  shift 2 ;;
         --include_t7)     INCLUDE_T7=1; TO_PHASE=4; shift ;;
         --resume_t6_run_dir) RESUME_T6_RUN_DIR="$2"; shift 2 ;;
         --force_retrain_t6)  FORCE_RETRAIN_T6=1; shift ;;
@@ -217,7 +219,7 @@ cat <<EOF
   MAX_TRAIN       = $MAX_TRAIN (gsm8k train subset)
   PHASES          = $FROM_PHASE ... $TO_PHASE
   DRY_RUN         = $DRY_RUN   CHECK_ONLY = $CHECK_ONLY
-  T6              retries=$T6_RETRIES  steps=$T6_MAX_STEPS  gpus=$T6_GPUS
+  T6              retries=$T6_RETRIES  steps=$T6_MAX_STEPS  gpus=$T6_GPUS  batch=$T6_BATCH_SIZE
   INCLUDE_T7      = $INCLUDE_T7  (T7 N=$T7_N_SAMPLES steps=$T7_MAX_STEPS if enabled)
   SFT             bs=$BATCH_SIZE  grad_accum=$GRAD_ACCUM  (effective=$((BATCH_SIZE * GRAD_ACCUM)))
 EOF
@@ -303,6 +305,7 @@ phase_1() {
                             --max_train "$MAX_TRAIN"
                             --teacher_ckpt "$TEACHER_CKPT"
                             --retries "$T6_RETRIES"
+                            --batch_size "$T6_BATCH_SIZE"
                             --scope_path "$GSM8K_TRAIN_JSON"
                             --scope_group gsm8k)
             if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
@@ -315,6 +318,7 @@ phase_1() {
                            --n "$MAX_TRAIN"
                            --teacher local --local_model "$TEACHER_CKPT"
                            --retries_per_prompt "$T6_RETRIES"
+                           --batch_size "$T6_BATCH_SIZE"
                            --max_tokens 800 --temperature 0.0)
             if [[ -n "$RESUME_T6_RUN_DIR" ]]; then
                 tt_args+=(--run_dir "$RESUME_T6_RUN_DIR" --resume)
