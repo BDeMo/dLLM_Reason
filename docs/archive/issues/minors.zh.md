@@ -10,12 +10,12 @@
 
 ## 2026-04 v1.6.x
 
-### [2026-04-20] v1.6.1 — pipeline 不用本地 `checkpoints/` + `datasets/` 注册路径
+### [2026-04-21] v1.6.1 — pipeline 不用本地 `checkpoints/` + `datasets/` 注册路径
 - Project 早有 `src/dllm_reason/utils/local_resolve.py` + `resource_registry.py`，能解析 `GSAI-ML/LLaDA-8B-Instruct` → `checkpoints/llada-instruct/` + `openai/gsm8k` → `datasets/gsm8k/<split>/`
-- 但 v1.6.1 的 `load_gsm8k_train.py` / `regen_scope.py` 直接 `load_dataset(...)`，绕过 resolver → mirror 失效就崩
-- LLaDAWrapper 内部已经调 `resolve_model_path`（OK），但 dataset 那条线被 bypass 了
-- Fix: 改成先试 `resolve_dataset()` 再 fallback HF；`run_all_v1.6.1.sh` 加 `--offline` (HF cache-only) + `--gsm8k_test_local` (本地 JSON 完全跳 HF)
-- Commit: see v1.6.1 patch series
+- 也有 `scripts/download_models.py` / `scripts/download_datasets.py` 把数据下到注册路径
+- v1.6.1 早期版本绕开了这套，直接 `load_dataset(...)` + 加 `--offline` workaround；user 指出方向错
+- **正解**：Phase 0 用 `download_models.py` + `download_datasets.py` 把 LLaDA + GSM8K 下到 `checkpoints/llada-instruct/` 和 `datasets/gsm8k/{train,test}/`；后续 phase 通过 `resolve_dataset` 自动命中本地，**`--offline` 不需要**（仍保留作 escape hatch）
+- 教训：找现有 infra 之前别先写 workaround
 
 ### [2026-04-20] v1.6.1 — `--batch_size` forward miss on no-trailing-\ line
 - `run_t6_shards.sh` 里 aggregate pass 最后一行无 `\` 续行，`sed replace_all` 没匹配到 → 只第一处（shard 调用）有 `--batch_size`，第二处（aggregate）没转发

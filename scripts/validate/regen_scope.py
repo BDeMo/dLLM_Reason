@@ -160,16 +160,14 @@ def main():
     ap.add_argument("--mirror", type=str, default=None,
                     help="HF endpoint: default / hf-mirror / modelscope / URL")
     ap.add_argument("--gsm8k_test_path", type=str, default=None,
-                    help="Skip HF entirely; load gsm8k test from this local JSON. "
-                         "Schema: list of {prompt, ground_truth} OR raw "
-                         "{question, answer} HF format. Use this when network "
-                         "/ mirror is down. Generate via: "
-                         "python load_gsm8k_train.py --split test "
-                         "--output runs/validation/gsm8k_test_prompts.json")
+                    help="(rarely needed) Bypass resolver, load gsm8k test from "
+                         "this local JSON. Use only if datasets/gsm8k/test/ is "
+                         "unavailable and you have a custom prompt list.")
     ap.add_argument("--offline", action="store_true",
-                    help="Force HF cache-only mode (HF_DATASETS_OFFLINE=1). "
-                         "Use this when first download succeeded but mirror "
-                         "is now flaky. Fails if dataset not previously cached.")
+                    help="(rarely needed) Force HF cache-only mode. Normally "
+                         "the project's resolve_dataset() prefers local "
+                         "datasets/gsm8k/test/ already; this flag is only "
+                         "useful if HF cache verification is causing trouble.")
     # Sharding
     ap.add_argument("--prompt_start", type=int, default=None)
     ap.add_argument("--prompt_end", type=int, default=None)

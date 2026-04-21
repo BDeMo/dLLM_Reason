@@ -23,20 +23,23 @@
 #   bash scripts/run_all_v1.6.1.sh --from_phase 3   # skip downloads / scope
 #   bash scripts/run_all_v1.6.1.sh --dry_run
 #
-# Local-first / offline mode:
-#   The pipeline uses dllm_reason.utils.local_resolve under the hood, which
-#   prefers project-registered local paths (checkpoints/llada-instruct/,
-#   datasets/gsm8k/) over HF downloads. This works automatically — no flag
-#   needed — as long as the registered local paths exist.
+# Local-first behavior (no --offline flag needed):
+#   Phase 0 invokes the project's registered downloaders:
+#     - scripts/download_models.py --models llada-instruct
+#         → checkpoints/llada-instruct/
+#     - scripts/download_datasets.py --datasets gsm8k
+#         → datasets/gsm8k/{train,test}/  (save_to_disk format)
+#     - scripts/download_qwen.py --sizes <T>
+#         → checkpoints/Qwen__Qwen<T>/
+#   All three are idempotent: skip if files present + verified.
 #
-#   Extra flags for fully-offline / mirror-down scenarios:
-#     --offline                Set HF_DATASETS_OFFLINE=1 and TRANSFORMERS_
-#                              OFFLINE=1; uses HF cache only. Fails if
-#                              dataset/model not previously cached.
-#     --gsm8k_test_local PATH  Skip HF entirely for scope regen by reading
-#                              gsm8k test from a local JSON file (e.g.
-#                              runs/validation/gsm8k_test_prompts.json
-#                              produced by load_gsm8k_train.py --split test).
+#   Subsequent phases (regen scope, T6 trace, SFT, eval) all use the
+#   project's local-first resolvers (resolve_model_path, resolve_dataset)
+#   so they hit the registered local paths automatically. HF is only
+#   contacted when a local path is missing AND Phase 0 was skipped.
+#
+#   Mirror is consulted only if a download is actually needed (Phase 0
+#   first run, or when files were manually deleted).
 #
 # Multi-GPU summary (all phases now parallelizable):
 #   --scope_gpus N   Phase 2 scope regen (default 8). Each GPU runs its
@@ -72,8 +75,6 @@ T6_BATCH_SIZE=8
 SCOPE_GPUS=8                        # multi-GPU scope regen (Phase 2). 1 = single
 SFT_GPUS=8                          # multi-GPU T6 SFT via torchrun DDP. 1 = single
 EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
-OFFLINE=0                           # 1 = HF cache-only (HF_DATASETS_OFFLINE=1)
-GSM8K_TEST_LOCAL=""                 # path to local gsm8k test JSON (skip HF)
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
 T6_MAX_STEPS=2000
@@ -100,8 +101,6 @@ while [[ $# -gt 0 ]]; do
         --scope_gpus)         SCOPE_GPUS="$2"; shift 2 ;;
         --sft_gpus)           SFT_GPUS="$2"; shift 2 ;;
         --eval_gpus)          EVAL_GPUS="$2"; shift 2 ;;
-        --offline)            OFFLINE=1; shift ;;
-        --gsm8k_test_local)   GSM8K_TEST_LOCAL="$2"; shift 2 ;;
         --t6_retries)         T6_RETRIES="$2"; shift 2 ;;
         --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
         --t6_max_steps)       T6_MAX_STEPS="$2"; shift 2 ;;
@@ -164,8 +163,7 @@ check_file() {
 hdr "v1.6.1 Pipeline — Run All"
 cat <<EOF
   ROOT              = $ROOT
-  MIRROR            = $MIRROR  (OFFLINE=$OFFLINE)
-  GSM8K_TEST_LOCAL  = ${GSM8K_TEST_LOCAL:-"(use registered datasets/gsm8k/)"}
+  MIRROR            = $MIRROR  (used only if local cache miss)
   TEACHER_SIZE      = $TEACHER_SIZE
   TEACHER_CKPT      = $TEACHER_CKPT
   MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
@@ -188,25 +186,66 @@ EOF
 #  PHASE 0 — Downloads
 # ═════════════════════════════════════════════════════════════════════════════
 phase_0() {
-    hdr "Phase 0 — Downloads (Qwen + gsm8k train)"
-    run_or_dry "Download Qwen teacher ($TEACHER_SIZE)" \
+    hdr "Phase 0 — Materialize registered local data (idempotent)"
+
+    # Build mirror URL kwarg only if MIRROR is a non-default value.
+    # "default" / "" → no flag; let downloader use HF default
+    # "hf-mirror" / "modelscope" → canonical URL
+    # http(s)://... → pass through
+    local mirror_flag=()
+    case "$MIRROR" in
+        ""|default)         ;;
+        hf-mirror)          mirror_flag=(--mirror "https://hf-mirror.com") ;;
+        modelscope)         mirror_flag=(--mirror "https://www.modelscope.cn") ;;
+        http://*|https://*) mirror_flag=(--mirror "$MIRROR") ;;
+        *)                  mirror_flag=(--mirror "$MIRROR") ;;
+    esac
+
+    # 0a: LLaDA via the project-registered downloader. Saves to
+    #     checkpoints/llada-instruct/ where resolve_model_path will find it.
+    #     Idempotent (skip if files present + verified).
+    run_or_dry "Download LLaDA-Instruct (registered → checkpoints/llada-instruct/)" \
+        python scripts/download_models.py \
+        --models llada-instruct "${mirror_flag[@]}"
+
+    # 0b: GSM8K via project-registered downloader. Saves both splits to
+    #     datasets/gsm8k/{train,test}/ via save_to_disk so resolve_dataset
+    #     can later load_from_disk without ANY HF call.
+    run_or_dry "Download GSM8K (registered → datasets/gsm8k/{train,test}/)" \
+        python scripts/download_datasets.py \
+        --datasets gsm8k "${mirror_flag[@]}"
+
+    # 0c: Qwen teacher via our v1.6 downloader (saves to
+    #     checkpoints/Qwen__<name>/). Not in MODEL_REGISTRY (yet),
+    #     but absolute path works fine for t6_teacher_trace.
+    run_or_dry "Download Qwen teacher ($TEACHER_SIZE → checkpoints/Qwen__...)" \
         python scripts/download_qwen.py \
         --sizes "$TEACHER_SIZE" --mirror "$MIRROR"
-    local gsm_args=(--max_samples "$MAX_TRAIN")
-    if [[ "$OFFLINE" -eq 1 ]]; then
-        gsm_args+=(--offline)
-    else
-        gsm_args+=(--mirror "$MIRROR")
-    fi
-    run_or_dry "Load gsm8k train prompts (max $MAX_TRAIN)" \
-        python scripts/validate/load_gsm8k_train.py "${gsm_args[@]}"
+
+    # 0d: Convert downloaded gsm8k train into our scope JSON shape (still
+    #     needed because t6_teacher_trace consumes that JSON, not the HF
+    #     Dataset object). After this, runs/validation/gsm8k_train_prompts.json
+    #     references local data only.
+    run_or_dry "Materialize gsm8k_train_prompts.json from local datasets/" \
+        python scripts/validate/load_gsm8k_train.py \
+        --max_samples "$MAX_TRAIN"
 
     echo
     echo "[CHECK Phase 0]"
     local ok=1
     python scripts/download_qwen.py --sizes "$TEACHER_SIZE" --check_only \
         --min_weights_gb 1.0 || ok=0
-    check_file "$GSM8K_TRAIN" "gsm8k train" 1000 || ok=0
+    check_file "$GSM8K_TRAIN" "gsm8k_train_prompts.json" 1000 || ok=0
+    if [[ -d "$ROOT/datasets/gsm8k/train" ]] && [[ -d "$ROOT/datasets/gsm8k/test" ]]; then
+        echo "  ✓ datasets/gsm8k/train/ + test/ registered"
+    else
+        echo "  ✗ datasets/gsm8k/{train,test}/ missing — resolve_dataset will fall back to HF"
+    fi
+    if [[ -d "$ROOT/checkpoints/llada-instruct" ]]; then
+        echo "  ✓ checkpoints/llada-instruct/ registered"
+    else
+        echo "  ✗ checkpoints/llada-instruct/ missing — LLaDAWrapper will fall back to HF"
+    fi
     [[ "$ok" -eq 1 ]] || { echo "[PHASE 0] ✗ FAIL"; exit 1; }
     echo "[PHASE 0] ✓ PASS"
 }
@@ -268,19 +307,18 @@ phase_1() {
 phase_2() {
     hdr "Phase 2 — Regenerate scope ($SCOPE_GPUS-GPU, gsm8k test → scope_fail/ok)"
 
+    # gsm8k test now comes from datasets/gsm8k/test/ (Phase 0 materialized
+    # via download_datasets.py). resolve_dataset will load from disk; no
+    # HF call needed even on flaky network.
+
     if [[ "$SCOPE_GPUS" -gt 1 ]]; then
-        # Multi-GPU shards
         local regen_args=(
             --gpus "$SCOPE_GPUS"
             --base_port "$((SERVER_PORT + 100))"
         )
-        [[ "$OFFLINE" -eq 1 ]] && regen_args+=(--offline) \
-                              || regen_args+=(--mirror "$MIRROR")
-        [[ -n "$GSM8K_TEST_LOCAL" ]] && \
-            regen_args+=(--gsm8k_test_path "$GSM8K_TEST_LOCAL")
         [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
             regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
-        run_or_dry "Regenerate scope ($SCOPE_GPUS-GPU shard)" \
+        run_or_dry "Regenerate scope ($SCOPE_GPUS-GPU shard, local-first)" \
             bash scripts/run_regen_scope_shards.sh "${regen_args[@]}"
     else
         local regen_args=(
@@ -289,13 +327,9 @@ phase_2() {
             --block_length 32
             --temperature 0
         )
-        [[ "$OFFLINE" -eq 1 ]] && regen_args+=(--offline) \
-                              || regen_args+=(--mirror "$MIRROR")
-        [[ -n "$GSM8K_TEST_LOCAL" ]] && \
-            regen_args+=(--gsm8k_test_path "$GSM8K_TEST_LOCAL")
         [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
             regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
-        run_or_dry "Regenerate scope (single-GPU)" \
+        run_or_dry "Regenerate scope (single-GPU, local-first)" \
             python scripts/validate/regen_scope.py "${regen_args[@]}"
     fi
 
