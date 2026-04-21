@@ -65,6 +65,15 @@ def parse_args():
                     help="prompt + target length cap. 768 safe for gsm8k "
                          "prompt (100-300 tok) + cleaned teacher trace "
                          "(~100-500 tok). Bump if seeing 'exceeds max_seq_len'.")
+    ap.add_argument("--gradient_checkpointing", action="store_true", default=True,
+                    help="Enable HF gradient checkpointing on the inner "
+                         "LLaDA model. Trades ~20% speed for ~60% activation "
+                         "memory reduction. REQUIRED for 8B full-precision "
+                         "SFT on A100-80GB with batch_size > 0 (otherwise OOM "
+                         "in attention forward).")
+    ap.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing",
+                    action="store_false",
+                    help="Disable gradient checkpointing (only if you have >80GB GPU).")
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum_steps", type=int, default=4,
@@ -152,6 +161,27 @@ def main():
             p.requires_grad_(True)
             n_params += p.numel()
         maybe_print(f"[T6T7] model: {n_params/1e6:.1f}M params, all trainable")
+
+        # Enable gradient checkpointing on the underlying HF model so
+        # activations are re-computed in backward instead of stashed.
+        # Saves ~60% activation memory at ~20% speed cost. Essential for
+        # 8B + bf16 + AdamW fp32 on A100-80GB (model=16G + grads=16G +
+        # optim=64G leaves ~16G for activations, which blows up at
+        # batch_size*seq_len even with attention kernel fusions).
+        if args.gradient_checkpointing:
+            inner = getattr(model, "_llada", None)
+            if inner is not None and hasattr(inner, "gradient_checkpointing_enable"):
+                inner.gradient_checkpointing_enable()
+                # gradient checkpointing + use_cache=True is incompatible
+                if hasattr(inner, "config"):
+                    try:
+                        inner.config.use_cache = False
+                    except Exception:
+                        pass
+                maybe_print(f"[T6T7] gradient_checkpointing_enable() on ._llada ✓")
+            else:
+                maybe_print(f"[T6T7] WARN: could not enable gradient checkpointing "
+                            f"(no ._llada or missing method). You may OOM.")
 
         # Wrap in DDP if launched via torchrun
         if is_ddp:

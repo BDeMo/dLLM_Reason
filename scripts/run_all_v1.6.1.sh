@@ -78,8 +78,8 @@ EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
 T6_MAX_STEPS=2000
-T6_BATCH_SIZE_SFT=4
-T6_GRAD_ACCUM=4
+T6_BATCH_SIZE_SFT=1                 # per-rank batch; 1 is OOM-safe for 8B+DDP+80GB
+T6_GRAD_ACCUM=16                    # effective batch = 1 × 16 × SFT_GPUS
 T6_LR=2e-5
 EVAL_GEN_LENGTH=128                # MUST match scope canonical
 EVAL_BLOCK_LENGTH=32

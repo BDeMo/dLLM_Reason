@@ -10,6 +10,12 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — T6 SFT DDP 8B+bf16+AdamW 在 80GB A100 必 OOM
+- 内存账：model weights bf16 ~16G + gradients bf16 ~16G + AdamW fp32 moments 2× ~64G = **96G 只是 optimizer state + weights**，80G A100 直接爆
+- User trace: `OOM in attention forward, 72 MiB needed, 65 MiB free, 79G in use`
+- Fix: 开 HF `gradient_checkpointing_enable()` 省 ~60% activation，`--batch_size 1 --grad_accum 16`（effective batch 不变 = 1×16×8=128）
+- 彻底解决需 Adam8bit / FSDP / LoRA（v1.6.2+）；现在 GC + bs=1 够 80GB 单卡跑 8B
+
 ### [2026-04-21] v1.6.1 — `regen_scope.py` shard race on per_prompt key
 - `prompt_key(i)` 用的是 `enumerate(prompts)` 的本地 i，而 `prompts` 是分片切完的子集 → 8 个 shard **全部从 `t0000` 开始**
 - 所有 shard 写 `per_prompt/t0000.json.tmp` 互抢 → 一个 `os.replace(tmp, .json)` 后另一个找不到 tmp → `FileNotFoundError: ... t0000.json.tmp`
