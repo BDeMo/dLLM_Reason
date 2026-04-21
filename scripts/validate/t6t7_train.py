@@ -250,6 +250,32 @@ def main():
         )
 
     trainer = Finetuner(model, train_loader, val_loader, cfg)
+
+    # ── Resume from latest step_*.pt if present in save_dir ──────────────────
+    # Finetuner has load_checkpoint(path) that restores model + optimizer +
+    # scheduler + global_step. Pick the highest-step file.
+    latest_ckpt = None
+    if save_dir.exists():
+        step_ckpts = sorted(
+            save_dir.glob("step_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1]) if "_" in p.stem else 0,
+        )
+        if step_ckpts:
+            latest_ckpt = step_ckpts[-1]
+    if latest_ckpt is not None and hasattr(trainer, "load_checkpoint"):
+        try:
+            trainer.load_checkpoint(latest_ckpt)
+            maybe_print(f"[T6T7] resumed from {latest_ckpt.name} "
+                        f"(global_step={trainer.global_step})")
+        except Exception as e:
+            maybe_print(f"[T6T7] WARN: resume from {latest_ckpt} failed: {e!r}")
+            maybe_print(f"[T6T7]   starting fresh from init_ckpt")
+    elif latest_ckpt is not None:
+        maybe_print(f"[T6T7] found {latest_ckpt} but Finetuner lacks "
+                    f"load_checkpoint; starting fresh")
+    else:
+        maybe_print(f"[T6T7] no prior step_*.pt in {save_dir}; fresh start")
+
     trainer.train()
 
     # In DDP mode, wait for all ranks to finish training before HF export
