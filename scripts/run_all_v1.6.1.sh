@@ -78,9 +78,13 @@ EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
 T6_MAX_STEPS=2000
-T6_BATCH_SIZE_SFT=1                 # per-rank batch; 1 is OOM-safe for 8B+DDP+80GB
+T6_BATCH_SIZE_SFT=1                 # per-rank batch
 T6_GRAD_ACCUM=16                    # effective batch = 1 × 16 × SFT_GPUS
 T6_LR=2e-5
+T6_PARALLEL="fsdp"                  # fsdp (default for 8B) | ddp
+T6_USE_LORA=0                       # 1 = LoRA adapters; base weights frozen
+T6_LORA_R=16
+T6_LORA_ALPHA=32
 EVAL_GEN_LENGTH=128                # MUST match scope canonical
 EVAL_BLOCK_LENGTH=32
 EVAL_TEMPERATURE=0
@@ -105,6 +109,10 @@ while [[ $# -gt 0 ]]; do
         --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
         --t6_max_steps)       T6_MAX_STEPS="$2"; shift 2 ;;
         --t6_lr)              T6_LR="$2"; shift 2 ;;
+        --t6_parallel)        T6_PARALLEL="$2"; shift 2 ;;
+        --t6_use_lora)        T6_USE_LORA=1; shift ;;
+        --t6_lora_r)          T6_LORA_R="$2"; shift 2 ;;
+        --t6_lora_alpha)      T6_LORA_ALPHA="$2"; shift 2 ;;
         --server_port)        SERVER_PORT="$2"; shift 2 ;;
         --from_phase)         FROM_PHASE="$2"; shift 2 ;;
         --to_phase)           TO_PHASE="$2"; shift 2 ;;
@@ -169,7 +177,8 @@ cat <<EOF
   MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
   MAX_SCOPE         = ${MAX_SCOPE_PROMPTS:-"all 1319"} (gsm8k test, for scope regen)
   SCOPE_GPUS        = $SCOPE_GPUS  (Phase 2; 1 = single via Phase-1 serve)
-  SFT_GPUS          = $SFT_GPUS  (Phase 4 DDP via torchrun; 1 = single)
+  SFT_GPUS          = $SFT_GPUS  (Phase 4 $T6_PARALLEL via torchrun; 1 = single)
+  T6_USE_LORA       = $T6_USE_LORA  (r=$T6_LORA_R, α=$T6_LORA_ALPHA)
   EVAL_GPUS         = $EVAL_GPUS  (Phase 5 parallel ckpts; 1 = serial)
   T6_GPUS           = $T6_GPUS
   T6_BATCH_SIZE     = $T6_BATCH_SIZE  (HF pipeline batching per shard)
@@ -390,9 +399,14 @@ phase_4() {
         local launcher="python"
         if [[ "$SFT_GPUS" -gt 1 ]]; then
             launcher="torchrun --standalone --nproc_per_node=$SFT_GPUS"
-            echo "[PHASE 4] DDP enabled: $SFT_GPUS GPUs via torchrun"
+            echo "[PHASE 4] parallel=$T6_PARALLEL on $SFT_GPUS GPUs via torchrun"
         fi
-        run_or_dry "T6 SFT (gpus=$SFT_GPUS)" \
+        local lora_flags=()
+        if [[ "$T6_USE_LORA" -eq 1 ]]; then
+            lora_flags=(--use_lora --lora_r "$T6_LORA_R" --lora_alpha "$T6_LORA_ALPHA")
+            echo "[PHASE 4] LoRA ON  r=$T6_LORA_R α=$T6_LORA_ALPHA"
+        fi
+        run_or_dry "T6 SFT (gpus=$SFT_GPUS parallel=$T6_PARALLEL lora=$T6_USE_LORA)" \
             $launcher scripts/validate/t6t7_train.py \
             --jsonl_path "$T6_SFT_JSONL" \
             --run_name v161_t6 \
@@ -400,7 +414,9 @@ phase_4() {
             --max_steps "$T6_MAX_STEPS" \
             --batch_size "$T6_BATCH_SIZE_SFT" --grad_accum_steps "$T6_GRAD_ACCUM" \
             --lr "$T6_LR" \
-            --max_seq_len 768
+            --max_seq_len 768 \
+            --parallel "$T6_PARALLEL" \
+            "${lora_flags[@]}"
     fi
 
     echo

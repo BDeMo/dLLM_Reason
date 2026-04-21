@@ -141,12 +141,20 @@ class Finetuner(Trainer):
                 logger.info(f"Finetune step {self.global_step}: loss={avg_loss:.4f}")
                 accum_loss = 0.0
 
+            # All-reduce val_loss so every rank takes the same best-save
+            # decision. save_checkpoint is collective-safe (state_dict()
+            # all-gather inside; only rank 0 writes).
             if self.val_loader and self.global_step % cfg.eval_every == 0:
                 val_loss = self.evaluate()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    t = torch.tensor(val_loss, device=device)
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                    val_loss = t.item()
                 logger.info(f"Finetune step {self.global_step}: val_loss={val_loss:.4f}")
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.save_checkpoint(save_dir / "best.pt")
 
+            # Step ckpt: ALL ranks enter (collective state_dict inside)
             if self.global_step % cfg.save_every == 0:
                 self.save_checkpoint(save_dir / f"step_{self.global_step}.pt")

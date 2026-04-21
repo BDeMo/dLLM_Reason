@@ -10,6 +10,37 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — 六连 bug 扫荡（SFT path 全面 audit）
+1. **FSDP HF-export 死锁**：非 main rank 在 export 前 `return`，rank 0 进 `summon_full_params(rank0_only=True)` 集体 → 永久 hang。Fix: 所有 rank 进集体，只 rank 0 写盘，末尾 `dist.barrier()`。
+2. **LoRA optimizer 重建后 scheduler 挂旧 optim**：`Finetuner.__init__` 把 `scheduler = CosineAnnealingWarmRestarts(self.optimizer, ...)` 绑死。rebuild `trainer.optimizer` 后 scheduler 步的是废 optim，新 optim 永远初始 lr。Fix: scheduler 一并重建。
+3. **Finetuner.train() 少 rank-0 guard**：`pretrain.Trainer` 有，`finetune.Finetuner` 漏了。所有 rank 并发写 `step_N.pt`，FSDP 下非 rank0 的 state_dict 空 → 覆盖掉真 ckpt。Fix: `save_checkpoint` 改成集体安全（所有 rank 进 `state_dict()` all-gather，只 rank 0 `torch.save()`），callers 不再需要 guard。
+4. **FSDP resume 静默 OOM**：`Trainer.load_checkpoint` plain `load_state_dict(torch.load(..., map_location=local_rank))` → 完整 state 塞单 GPU + 与 FSDP 的 shard shape 不兼容。Fix: FSDP 路径直接 refuse resume 给明确 workaround（fresh 或 ddp+lora resume）。
+5. **LoRA target_modules 默认 Llama 命名**：`q_proj,k_proj,v_proj,o_proj` 在 LLaDA（可能 OLMo-style `att_proj`）上 peft 抛 `ValueError: Target modules not found`。Fix: catch 它，打印实际 Linear 模块名指引用户重新指定。
+6. **val_loss 无 all-reduce + best.pt 选取非确定**：DDP/FSDP 下每 rank 拿自己 val shard，各 rank 判断何时 save best 不一致。Fix: val_loss 先 all-reduce AVG，所有 rank 同步决策。
+
+附带小优化：
+- load 时加 `torch_dtype=torch.bfloat16` — 每 rank 从 fp32 32GB peak 降到 bf16 16GB
+- 删 `state = inner.state_dict()` 死代码（无用但触发一次集体通信）
+
+### [2026-04-21] v1.6.1 — Finetuner ckpt 无滚动清理，磁盘秒爆
+- 症状：`runs/training/v161_t6/` 下每 `save_every=500` 步多一个 `step_N.pt`，旧的**不删**
+- 每个 ckpt = `model_state + optimizer_state + scheduler`；8B fp32 AdamW ≈ 96 GB/文件。max_steps=2000 / save_every=500 → 4 个 step_*.pt + best.pt ≈ **~480 GB**
+- Fix: `TrainConfig.keep_last_n=2` 默认（只保留最近 2 个 step_*.pt，`best.pt` 永不删），`save_checkpoint` 末尾按 step 数字排序 `unlink()` 掉老的
+- 透出 `--keep_last_n` CLI（`t6t7_train.py`）；0 = 保留全部（旧行为）
+
+### [2026-04-21] v1.6.1 — Phase 4 SFT OOM 正解：FSDP + 可选 LoRA
+- 症状：`torchrun --nproc_per_node=8 t6t7_train.py` 在 8B + fp32 AdamW 下 OOM（80GB A100，optimizer moments 64G 单卡存不下）
+- 之前走过：gradient_checkpointing（LLaDA remote code 拒） → bitsandbytes AdamW8bit（user：**不要 quant**） → adafactor（user：**FSDP 吧**）
+- 正解：`--parallel fsdp`（默认）—— FULL_SHARD 把 weights/grads/optim-state 8 路切分，8B 单卡占用从 ~96G 降到 ~30G
+- 关键点：
+  - FSDP 只包 `model._llada`，外层 `LLaDAWrapper` 不动，`.noise_input / .mask_token_id / .device / .tokenizer` 直接可用，**不再需要 TransparentDDP 属性兜底**
+  - `use_orig_params=True` 必开：LoRA mixed frozen/trainable + Finetuner 按 `requires_grad` 过滤都依赖原 param 对象
+  - bf16 MixedPrecision（param/reduce/buffer 全 bf16）
+  - `set_state_dict_type(FULL_STATE_DICT, rank0_only=True, offload_to_cpu=True)` → HF export 时 `state_dict()` 自动 all-gather 到 rank 0
+- 同时实装 `--use_lora`（peft）：target_modules=`q,k,v,o_proj`，r=16 α=32。base 8B 冻结 → optim-state 跌 ~1000×，ddp/单卡也能跑
+- `--lora_merge_on_save`（默认 True）：保存前 `merge_and_unload()`，下游 serve.py 不需要 peft 依赖
+- Files: `scripts/validate/t6t7_train.py` + `scripts/run_all_v1.6.1.sh`（新增 `--t6_parallel`/`--t6_use_lora`/`--t6_lora_r`/`--t6_lora_alpha`）
+
 ### [2026-04-21] v1.6.1 — LLaDA remote code 不支持 gradient_checkpointing_enable
 - `inner._llada.gradient_checkpointing_enable()` 抛 `ValueError: LLaDAModelLM does not support gradient checkpointing`
 - LLaDA 的 modeling_llada.py 没设 `_supports_gradient_checkpointing = True`
