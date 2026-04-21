@@ -110,21 +110,29 @@ def load_gsm8k_test(max_prompts: int | None, mirror: str | None,
     else:
         apply_mirror(mirror)
 
-    # Project-first: prefer datasets/gsm8k/test/ (registered local cache)
-    # before falling back to HF download.
+    # Project-first: REQUIRE datasets/gsm8k/test/ (registered local cache).
+    # If missing, fail loud with a fix command — DON'T silently fall back to
+    # HF download (which is what triggered the user's network error: the
+    # multi-GPU regen shards launched without running Phase 0 first).
+    local_test_dir = ROOT / "datasets" / "gsm8k" / "test"
+    if not (local_test_dir / "dataset_info.json").exists():
+        print()
+        print(f"[REGEN] ✗ Local gsm8k test split not found at:")
+        print(f"        {local_test_dir}")
+        print(f"[REGEN] Either:")
+        print(f"  (a) Materialize via the registered downloader (recommended):")
+        print(f"      python scripts/download_datasets.py --datasets gsm8k")
+        print(f"  (b) Pass an explicit local JSON via --gsm8k_test_path PATH")
+        print(f"  (c) Or use the v1.6.1 master script which runs (a) in Phase 0:")
+        print(f"      bash scripts/run_all_v1.6.1.sh --from_phase 0 --to_phase 0")
+        print(f"[REGEN] Refusing to silently fall back to a HuggingFace HTTP "
+              f"download (your earlier network error originated from that path).")
+        sys.exit(1)
+
     sys.path.insert(0, str(ROOT / "src"))
-    try:
-        from dllm_reason.utils.local_resolve import resolve_dataset
-        print(f"[REGEN] resolving via project registry "
-              f"(datasets/gsm8k/test/ first)")
-        ds = resolve_dataset("openai/gsm8k", config="main", split="test")
-    except ImportError:
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            print("[REGEN] ERROR: pip install datasets", file=sys.stderr)
-            sys.exit(1)
-        ds = load_dataset("openai/gsm8k", "main", split="test")
+    from dllm_reason.utils.local_resolve import resolve_dataset
+    print(f"[REGEN] loading from local registered path: {local_test_dir}")
+    ds = resolve_dataset("openai/gsm8k", config="main", split="test")
     print(f"[REGEN] gsm8k test loaded: {len(ds)}")
     if max_prompts:
         ds = ds.select(range(min(max_prompts, len(ds))))

@@ -55,6 +55,18 @@ echo "[REGEN-SH] MIRROR       = $MIRROR"
 echo "[REGEN-SH] RUN_DIR      = $RUN_DIR"
 echo "[REGEN-SH]"
 
+# ── Pre-flight: require local gsm8k test (no silent HF fallback) ─────────────
+if [[ -z "$GSM8K_TEST_PATH" ]] && \
+   [[ ! -f "$ROOT/datasets/gsm8k/test/dataset_info.json" ]]; then
+    echo "[REGEN-SH] ✗ Local gsm8k test split missing:"
+    echo "          $ROOT/datasets/gsm8k/test/"
+    echo "[REGEN-SH] Materialize first (one of):"
+    echo "  (a) python scripts/download_datasets.py --datasets gsm8k"
+    echo "  (b) bash scripts/run_all_v1.6.1.sh --from_phase 0 --to_phase 0"
+    echo "[REGEN-SH] Or pass --gsm8k_test_path PATH for a custom local JSON."
+    exit 1
+fi
+
 # ── Compute total prompts (prefer local JSON over HF) ────────────────────────
 TOTAL=$(python - <<PY
 import os, json

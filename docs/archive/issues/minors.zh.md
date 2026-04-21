@@ -10,6 +10,11 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — `regen_scope.py` 在 local 缺失时悄悄 fall-back HF
+- `resolve_dataset()` 设计是"local 优先，没有就 HF 下载"。在 *单独*跑 `run_regen_scope_shards.sh`（不经 Phase 0）时 `datasets/gsm8k/test/` 不存在 → fallback 真的去 HF → 网络断 / mirror 挂 → "huggingface.co Network unreachable" 错
+- User 困惑 "为什么要访问 huggingface.co"
+- Fix: `regen_scope.py` + `run_regen_scope_shards.sh` 都加 pre-flight check：local missing 直接 fail 给出 fix 命令（`python scripts/download_datasets.py --datasets gsm8k` 或 `bash run_all_v1.6.1.sh --from_phase 0 --to_phase 0`），**不再悄悄走网络**
+
 ### [2026-04-21] v1.6.1 — pipeline 不用本地 `checkpoints/` + `datasets/` 注册路径
 - Project 早有 `src/dllm_reason/utils/local_resolve.py` + `resource_registry.py`，能解析 `GSAI-ML/LLaDA-8B-Instruct` → `checkpoints/llada-instruct/` + `openai/gsm8k` → `datasets/gsm8k/<split>/`
 - 也有 `scripts/download_models.py` / `scripts/download_datasets.py` 把数据下到注册路径
