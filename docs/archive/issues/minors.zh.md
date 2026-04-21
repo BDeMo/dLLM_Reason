@@ -10,6 +10,11 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — `run_regen_scope_shards.sh` prompt counter 用 `load_dataset` 触发 HF
+- bash 启动时 `TOTAL=$(python heredoc { load_dataset("openai/gsm8k") })` 即使本地有 `datasets/gsm8k/test/dataset_info.json` 也会先 ping HF 验 metadata
+- User: "为什么要访问 huggingface.co" + "datasets/gsm8k/test/ 存在啊" + "dataset_info.json 也存在啊"
+- Fix: bash heredoc 改用 `load_from_disk(str(local_dir))`（不联网）+ parquet fallback；并 `export HF_HUB_OFFLINE=1` `HF_DATASETS_OFFLINE=1` 给整个 shell。同时 `regen_scope.py` 也设这些 env var 防 datasets 库内部 metadata refresh
+
 ### [2026-04-21] v1.6.1 — `regen_scope.py` 在 local 缺失时悄悄 fall-back HF
 - `resolve_dataset()` 设计是"local 优先，没有就 HF 下载"。在 *单独*跑 `run_regen_scope_shards.sh`（不经 Phase 0）时 `datasets/gsm8k/test/` 不存在 → fallback 真的去 HF → 网络断 / mirror 挂 → "huggingface.co Network unreachable" 错
 - User 困惑 "为什么要访问 huggingface.co"

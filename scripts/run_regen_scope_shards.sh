@@ -67,20 +67,42 @@ if [[ -z "$GSM8K_TEST_PATH" ]] && \
     exit 1
 fi
 
-# ── Compute total prompts (prefer local JSON over HF) ────────────────────────
+# ── Compute total prompts (FORCE local — never ping HF) ─────────────────────
+# Resolution order:
+#   1. --gsm8k_test_path PATH (custom local JSON from user)
+#   2. datasets/gsm8k/test/ via load_from_disk (save_to_disk format)
+#   3. datasets/gsm8k/test/*.parquet (raw HF cache format)
+# Any HF network access is FORBIDDEN here — pre-flight check above already
+# refused to launch if local data missing.
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 TOTAL=$(python - <<PY
 import os, json
-local = "$GSM8K_TEST_PATH"
+from pathlib import Path
+local_json = "$GSM8K_TEST_PATH"
 m = "$MAX_PROMPTS"
-if local and os.path.isfile(local):
-    n = len(json.load(open(local)))
+n = 0
+
+if local_json and os.path.isfile(local_json):
+    n = len(json.load(open(local_json)))
 else:
-    if "$OFFLINE" == "1":
-        os.environ["HF_DATASETS_OFFLINE"] = "1"
-        os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
-    from datasets import load_dataset
-    n = len(load_dataset("openai/gsm8k", "main", split="test"))
+    local_dir = Path("$ROOT/datasets/gsm8k/test")
+    if (local_dir / "dataset_info.json").exists():
+        from datasets import load_from_disk
+        n = len(load_from_disk(str(local_dir)))
+    else:
+        parquets = sorted(local_dir.glob("*.parquet"))
+        if parquets:
+            from datasets import load_dataset
+            n = len(load_dataset("parquet",
+                                 data_files=[str(p) for p in parquets],
+                                 split="train"))
+        else:
+            print("ERR: no recognized local format at " + str(local_dir),
+                  flush=True)
+            raise SystemExit(1)
+
 if m: n = min(n, int(m))
 print(n)
 PY

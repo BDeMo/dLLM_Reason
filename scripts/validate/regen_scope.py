@@ -60,6 +60,52 @@ DEFAULT_FAIL = OUT_BASE / "scope_fail_prompts.json"
 DEFAULT_OK = OUT_BASE / "scope_ok_prompts.json"
 
 
+def _try_load_local_gsm8k(local_dir: Path):
+    """Best-effort load of gsm8k test from a local directory in any of the
+    common formats. Returns an HF-Dataset-like object (iterable of dicts
+    with 'question' + 'answer'), or None if nothing recognized.
+
+    Accepted formats:
+      1. save_to_disk (dataset_info.json present) → load_from_disk
+      2. parquet (one or more *.parquet) → load_dataset('parquet', ...)
+      3. json / jsonl (one or more) → load_dataset('json', ...)
+    All three avoid HF network calls.
+    """
+    if not local_dir.exists():
+        return None
+    # 1. save_to_disk
+    if (local_dir / "dataset_info.json").exists():
+        try:
+            from datasets import load_from_disk
+            return load_from_disk(str(local_dir))
+        except Exception as e:
+            print(f"[REGEN] load_from_disk failed: {e!r}")
+
+    # 2. parquet
+    parquets = sorted(local_dir.glob("*.parquet"))
+    if parquets:
+        try:
+            from datasets import load_dataset
+            return load_dataset("parquet",
+                                data_files=[str(p) for p in parquets],
+                                split="train")  # always 'train' for raw files
+        except Exception as e:
+            print(f"[REGEN] parquet load failed: {e!r}")
+
+    # 3. json / jsonl
+    jsons = sorted(local_dir.glob("*.json")) + sorted(local_dir.glob("*.jsonl"))
+    if jsons:
+        try:
+            from datasets import load_dataset
+            return load_dataset("json",
+                                data_files=[str(p) for p in jsons],
+                                split="train")
+        except Exception as e:
+            print(f"[REGEN] json load failed: {e!r}")
+
+    return None
+
+
 def load_gsm8k_test(max_prompts: int | None, mirror: str | None,
                     local_path: str | None = None,
                     offline: bool = False) -> list[dict]:
@@ -110,29 +156,44 @@ def load_gsm8k_test(max_prompts: int | None, mirror: str | None,
     else:
         apply_mirror(mirror)
 
-    # Project-first: REQUIRE datasets/gsm8k/test/ (registered local cache).
-    # If missing, fail loud with a fix command — DON'T silently fall back to
-    # HF download (which is what triggered the user's network error: the
-    # multi-GPU regen shards launched without running Phase 0 first).
-    local_test_dir = ROOT / "datasets" / "gsm8k" / "test"
-    if not (local_test_dir / "dataset_info.json").exists():
-        print()
-        print(f"[REGEN] ✗ Local gsm8k test split not found at:")
-        print(f"        {local_test_dir}")
-        print(f"[REGEN] Either:")
-        print(f"  (a) Materialize via the registered downloader (recommended):")
-        print(f"      python scripts/download_datasets.py --datasets gsm8k")
-        print(f"  (b) Pass an explicit local JSON via --gsm8k_test_path PATH")
-        print(f"  (c) Or use the v1.6.1 master script which runs (a) in Phase 0:")
-        print(f"      bash scripts/run_all_v1.6.1.sh --from_phase 0 --to_phase 0")
-        print(f"[REGEN] Refusing to silently fall back to a HuggingFace HTTP "
-              f"download (your earlier network error originated from that path).")
-        sys.exit(1)
+    # FORCE local: bypass resolve_dataset entirely so even a buggy fallback
+    # path can't hit HF. We saw `huggingface.co/datasets/.../README.md` HEAD
+    # requests appear via load_dataset() metadata verification even when
+    # local cache exists, so we cut that codepath out.
+    #
+    # Also belt-and-suspenders: set HF_HUB_OFFLINE for this process so
+    # datasets-library internals don't ping hub for sidecar files
+    # (README.md, dataset_info.json metadata refresh, etc.).
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-    sys.path.insert(0, str(ROOT / "src"))
-    from dllm_reason.utils.local_resolve import resolve_dataset
-    print(f"[REGEN] loading from local registered path: {local_test_dir}")
-    ds = resolve_dataset("openai/gsm8k", config="main", split="test")
+    local_test_dir = ROOT / "datasets" / "gsm8k" / "test"
+    ds = _try_load_local_gsm8k(local_test_dir)
+    if ds is None:
+        print()
+        print(f"[REGEN] ✗ Could not load gsm8k test from {local_test_dir}")
+        if local_test_dir.exists():
+            files = sorted([p.name for p in local_test_dir.iterdir()])[:30]
+            print(f"[REGEN] dir exists with {len(files)}+ files; first names: {files}")
+            print(f"[REGEN] Tried: load_from_disk (needs dataset_info.json), "
+                  f"parquet glob, json/jsonl glob — none worked.")
+        else:
+            print(f"[REGEN] dir does not exist.")
+        print()
+        print(f"[REGEN] To fix, materialize via the registered downloader:")
+        print(f"  python scripts/download_datasets.py --datasets gsm8k")
+        print(f"   (this calls load_dataset(...).save_to_disk(datasets/gsm8k/<split>/))")
+        print(f"")
+        print(f"[REGEN] Or pass a flat JSON list explicitly:")
+        print(f"  --gsm8k_test_path runs/validation/gsm8k_test_prompts.json")
+        print(f"  (generate that via: python scripts/validate/load_gsm8k_train.py "
+              f"--split test --output runs/validation/gsm8k_test_prompts.json)")
+        print(f"")
+        print(f"[REGEN] Refusing to silently fall back to HuggingFace network "
+              f"(that's what gave you the MaxRetryError earlier).")
+        sys.exit(1)
+    print(f"[REGEN] loaded {len(ds)} items from {local_test_dir}")
     print(f"[REGEN] gsm8k test loaded: {len(ds)}")
     if max_prompts:
         ds = ds.select(range(min(max_prompts, len(ds))))
