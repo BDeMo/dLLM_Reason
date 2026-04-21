@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -85,13 +86,36 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
+    # ── Distributed init (DDP via torchrun) ──────────────────────────────────
+    # If launched via `torchrun --nproc_per_node N`, LOCAL_RANK is set per
+    # process. Otherwise we run single-GPU.
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_ddp = local_rank >= 0
+    if is_ddp:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        world_size = dist.get_world_size()
+        is_main = (dist.get_rank() == 0)
+        print(f"[T6T7] DDP rank={dist.get_rank()}/{world_size}  "
+              f"local_rank={local_rank}")
+    else:
+        world_size = 1
+        is_main = True
+
+    def maybe_print(msg):
+        if is_main:
+            print(msg)
+
     # ── Resolve run dir ──────────────────────────────────────────────────────
     if args.run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"{Path(args.jsonl_path).stem}_{ts}"
     save_dir = ROOT / "runs" / "training" / args.run_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[T6T7] save_dir = {save_dir}")
+    if is_main:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    maybe_print(f"[T6T7] save_dir = {save_dir}")
 
     # ── Load model + tokenizer ───────────────────────────────────────────────
     if args.dry_run:
@@ -101,26 +125,28 @@ def main():
                                                   trust_remote_code=True)
         model = None
     else:
-        print(f"[T6T7] loading model: {args.init_ckpt}")
+        maybe_print(f"[T6T7] loading model: {args.init_ckpt}")
         model = LLaDAWrapper(model_id=args.init_ckpt,
                              max_seq_len=args.max_seq_len)
         tokenizer = model.tokenizer
 
         # Ensure all parameters require grad + model is in train mode.
-        # AutoModel.from_pretrained + device_map='auto' can leave params
-        # with requires_grad=False; without this the loss has no grad_fn
-        # and loss.backward() raises
-        #   "element 0 of tensors does not require grad and does not have a grad_fn"
         model.train()
         n_params = 0
-        n_trainable = 0
         for p in model.parameters():
             p.requires_grad_(True)
             n_params += p.numel()
-            if p.requires_grad:
-                n_trainable += p.numel()
-        print(f"[T6T7] model: {n_params/1e6:.1f}M params, "
-              f"{n_trainable/1e6:.1f}M trainable (should equal n_params)")
+        maybe_print(f"[T6T7] model: {n_params/1e6:.1f}M params, all trainable")
+
+        # Wrap in DDP if launched via torchrun
+        if is_ddp:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            # device_map='auto' may have placed params on cuda:0; explicitly
+            # move to local_rank's device before DDP wrap.
+            model = model.to(f"cuda:{local_rank}")
+            model = DDP(model, device_ids=[local_rank],
+                        find_unused_parameters=False)
+            maybe_print(f"[T6T7] wrapped in DDP on cuda:{local_rank}")
 
     # ── Load dataset ─────────────────────────────────────────────────────────
     train_ds, val_ds = build_jsonl_dataset(
@@ -141,13 +167,28 @@ def main():
         print("[T6T7] dry-run complete — no training performed")
         return
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0,
-    )
+    # DataLoader: use DistributedSampler in DDP mode so each rank sees a
+    # disjoint shard of the dataset
+    if is_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed)
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0,
+        )
     val_loader = None
     if val_ds and len(val_ds) > 0:
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                                shuffle=False, num_workers=0)
+        if is_ddp:
+            val_sampler = DistributedSampler(val_ds, shuffle=False)
+            val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                                    sampler=val_sampler, num_workers=0)
+        else:
+            val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                                    shuffle=False, num_workers=0)
 
     # ── Configure + run Finetuner ────────────────────────────────────────────
     cfg = FinetuneConfig(
@@ -162,36 +203,41 @@ def main():
         loss_on_answer_only=True,
     )
 
-    # Save config + training meta
-    (save_dir / "train_meta.json").write_text(
-        json.dumps({
-            "cli_args": vars(args),
-            "finetune_config": cfg.__dict__,
-            "train_size": len(train_ds),
-            "val_size": len(val_ds) if val_ds else 0,
-            "started_at": datetime.now().isoformat(),
-        }, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # Save config + training meta (rank 0 only in DDP mode)
+    if is_main:
+        (save_dir / "train_meta.json").write_text(
+            json.dumps({
+                "cli_args": vars(args),
+                "finetune_config": cfg.__dict__,
+                "train_size": len(train_ds),
+                "val_size": len(val_ds) if val_ds else 0,
+                "world_size": world_size,
+                "started_at": datetime.now().isoformat(),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     trainer = Finetuner(model, train_loader, val_loader, cfg)
     trainer.train()
 
-    # ── Export HF-format checkpoint for serving ──────────────────────────────
-    # Finetuner saves .pt with {"model_state_dict": ...}, which cannot be loaded
-    # by AutoModel.from_pretrained. We additionally save an HF-format dir
-    # (config.json + *.safetensors + tokenizer files) so scripts/serve.py and
-    # any downstream eval can load the trained ckpt via --model_id.
+    # In DDP mode, wait for all ranks to finish training before HF export
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+
+    # ── Export HF-format checkpoint for serving (rank 0 only) ────────────────
+    if not is_main:
+        return  # non-main ranks exit; rank 0 does the HF export
+
     hf_dir = save_dir / "hf"
     hf_dir.mkdir(parents=True, exist_ok=True)
+    # In DDP, the actual model is wrapped: model.module is LLaDAWrapper.
+    inner_wrapper = model.module if is_ddp else model
     try:
-        # LLaDAWrapper exposes the underlying HF model as self._llada
-        # (confirmed in src/dllm_reason/models/llada.py). Try a few
-        # conventional names as fallback in case wrapper attribute changes.
         inner = None
         for attr in ("_llada", "_model", "model_internal", "model"):
-            if hasattr(model, attr):
-                cand = getattr(model, attr)
+            if hasattr(inner_wrapper, attr):
+                cand = getattr(inner_wrapper, attr)
                 if hasattr(cand, "save_pretrained"):
                     inner = cand
                     break
@@ -201,8 +247,10 @@ def main():
                 "(tried ._llada, ._model, .model_internal, .model)"
             )
         inner.save_pretrained(hf_dir, safe_serialization=True)
-        if hasattr(model, "tokenizer"):
-            model.tokenizer.save_pretrained(hf_dir)
+        # Tokenizer lives on inner_wrapper (the LLaDAWrapper); after DDP wrap,
+        # the wrapper itself is `model.module`, so use inner_wrapper here.
+        if hasattr(inner_wrapper, "tokenizer"):
+            inner_wrapper.tokenizer.save_pretrained(hf_dir)
         # Copy any trust_remote_code files from the source checkpoint
         # (modeling_llada.py, configuration_llada.py, etc.) if they exist
         src_path = Path(args.init_ckpt)

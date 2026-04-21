@@ -23,14 +23,19 @@
 #   bash scripts/run_all_v1.6.1.sh --from_phase 3   # skip downloads / scope
 #   bash scripts/run_all_v1.6.1.sh --dry_run
 #
-# Multi-GPU summary:
+# Multi-GPU summary (all phases now parallelizable):
 #   --scope_gpus N   Phase 2 scope regen (default 8). Each GPU runs its
-#                    own serve + client; ~8x speedup vs single GPU.
-#   --t6_gpus N      Phase 3 teacher trace (default 8). Same shard pattern
-#                    as run_t6_shards.sh; ~8x speedup.
-#   T6 SFT (Phase 4) is currently SINGLE GPU. Multi-GPU DDP for the SFT
-#   loop is on the v1.6.2 roadmap. ETA on 1× A100 ≈ 1.5h for 2k samples
-#   × 2000 steps; with multi-output traces (~5k SFT rows) ≈ 2h.
+#                    own serve + client; ~8× speedup.
+#   --t6_gpus N      Phase 3 teacher trace (default 8); same shard pattern.
+#   --sft_gpus N     Phase 4 T6 SFT via torchrun + DDP (default 8).
+#                    Effective batch = batch_size × grad_accum × N.
+#   --eval_gpus N    Phase 5 parallel ckpt eval (default 1 = serial).
+#                    >1 only helps if multiple ckpts to eval; each ckpt
+#                    pinned to one GPU.
+#
+# Target wall-time on 8×A100 with all flags ≥ 4:
+#   Phase 0 ~10 min, Phase 2 ~15 min, Phase 3 ~30 min, Phase 4 ~15 min
+#   (was ~1.5h single-GPU), Phase 5 ~15 min, Phase 6 seconds. Total ~1.5h.
 #
 # Defaults target the "big run" profile the user described:
 #   - Qwen3-8B teacher (compatible with stable transformers 4.x)
@@ -50,6 +55,7 @@ MAX_SCOPE_PROMPTS=""               # "" = full gsm8k test (1319)
 T6_GPUS=8
 T6_BATCH_SIZE=8
 SCOPE_GPUS=8                        # multi-GPU scope regen (Phase 2). 1 = single
+SFT_GPUS=8                          # multi-GPU T6 SFT via torchrun DDP. 1 = single
 EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
@@ -75,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --t6_gpus)            T6_GPUS="$2"; shift 2 ;;
         --t6_batch_size)      T6_BATCH_SIZE="$2"; shift 2 ;;
         --scope_gpus)         SCOPE_GPUS="$2"; shift 2 ;;
+        --sft_gpus)           SFT_GPUS="$2"; shift 2 ;;
         --eval_gpus)          EVAL_GPUS="$2"; shift 2 ;;
         --t6_retries)         T6_RETRIES="$2"; shift 2 ;;
         --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
@@ -143,7 +150,9 @@ cat <<EOF
   TEACHER_CKPT      = $TEACHER_CKPT
   MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
   MAX_SCOPE         = ${MAX_SCOPE_PROMPTS:-"all 1319"} (gsm8k test, for scope regen)
-  SCOPE_GPUS        = $SCOPE_GPUS  (Phase 2 multi-GPU; 1 = single via Phase-1 serve)
+  SCOPE_GPUS        = $SCOPE_GPUS  (Phase 2; 1 = single via Phase-1 serve)
+  SFT_GPUS          = $SFT_GPUS  (Phase 4 DDP via torchrun; 1 = single)
+  EVAL_GPUS         = $EVAL_GPUS  (Phase 5 parallel ckpts; 1 = serial)
   T6_GPUS           = $T6_GPUS
   T6_BATCH_SIZE     = $T6_BATCH_SIZE  (HF pipeline batching per shard)
   T6_RETRIES        = $T6_RETRIES  (v1.6.1: multi-output via T>0 + retries)
@@ -315,8 +324,13 @@ phase_4() {
     if [[ -f "$T6_CKPT_DIR/hf/config.json" ]]; then
         echo "[PHASE 4] T6 ckpt exists at $T6_CKPT_DIR/hf; skipping SFT"
     else
-        run_or_dry "T6 SFT" \
-            python scripts/validate/t6t7_train.py \
+        local launcher="python"
+        if [[ "$SFT_GPUS" -gt 1 ]]; then
+            launcher="torchrun --standalone --nproc_per_node=$SFT_GPUS"
+            echo "[PHASE 4] DDP enabled: $SFT_GPUS GPUs via torchrun"
+        fi
+        run_or_dry "T6 SFT (gpus=$SFT_GPUS)" \
+            $launcher scripts/validate/t6t7_train.py \
             --jsonl_path "$T6_SFT_JSONL" \
             --run_name v161_t6 \
             --init_ckpt "GSAI-ML/LLaDA-8B-Instruct" \
@@ -346,17 +360,74 @@ phase_5() {
     ts=$(date +%Y%m%d_%H%M%S)
     local EVAL_DIR="$ROOT/runs/validation/v161_eval_${ts}"
 
-    local eval_args=(
-        --out_dir "$EVAL_DIR"
-        --gen_length "$EVAL_GEN_LENGTH"
-        --block_length "$EVAL_BLOCK_LENGTH"
-        --temperature "$EVAL_TEMPERATURE"
-        --ckpts "baseline=GSAI-ML/LLaDA-8B-Instruct"
-    )
-    [[ -d "$T6_CKPT_DIR/hf" ]] && eval_args+=("t6=$T6_CKPT_DIR/hf")
+    # Build ckpt list
+    local CKPTS=("baseline=GSAI-ML/LLaDA-8B-Instruct")
+    [[ -d "$T6_CKPT_DIR/hf" ]] && CKPTS+=("t6=$T6_CKPT_DIR/hf")
 
-    run_or_dry "v1.6.1 eval" \
-        python scripts/validate/v16_eval.py "${eval_args[@]}"
+    if [[ "$EVAL_GPUS" -gt 1 ]] && [[ "${#CKPTS[@]}" -gt 1 ]]; then
+        # Parallel: one ckpt per GPU, each writes its own out_dir, merge after
+        echo "[PHASE 5] EVAL_GPUS=$EVAL_GPUS \u2192 parallel ckpt eval"
+        mkdir -p "$EVAL_DIR/per_prompt"
+        local PIDS=()
+        local g=0
+        for ck in "${CKPTS[@]}"; do
+            local label="${ck%%=*}"
+            local SUB="$EVAL_DIR/${label}_only"
+            run_or_dry "eval $label on GPU $g" \
+                "CUDA_VISIBLE_DEVICES=$g python scripts/validate/v16_eval.py \
+                 --ckpts $ck --out_dir $SUB \
+                 --gen_length $EVAL_GEN_LENGTH \
+                 --block_length $EVAL_BLOCK_LENGTH \
+                 --temperature $EVAL_TEMPERATURE &"
+            PIDS+=($!)
+            g=$((g + 1))
+            [[ "$g" -ge "$EVAL_GPUS" ]] && g=0   # cycle
+        done
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            echo "[PHASE 5] waiting on parallel evals: ${PIDS[*]}"
+            for p in "${PIDS[@]}"; do wait "$p"; done
+            # Merge per-ckpt summaries into EVAL_DIR
+            python - <<PY
+import json, glob, pathlib
+out = pathlib.Path("$EVAL_DIR")
+all_stats = []
+for s in sorted(glob.glob(str(out / "*_only" / "summary.json"))):
+    d = json.load(open(s))
+    all_stats.extend(d.get("ckpts", []))
+(out / "summary.json").write_text(
+    json.dumps({"ckpts": all_stats, "config": {
+        "gen_length": $EVAL_GEN_LENGTH, "block_length": $EVAL_BLOCK_LENGTH,
+        "temperature": $EVAL_TEMPERATURE,
+    }}, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+# Re-render comparison.md
+lines = ["# v1.6.1 Eval Comparison (parallel)\n",
+         "| Label | fail pass@1 | ok pass@1 | FAIL18 rescued | ceiling broken |",
+         "|---|---|---|---|---|"]
+for s in all_stats:
+    lines.append(
+        f"| {s['label']} | {s['fail_pass@1']:.2%} ({s['fail_correct']}/{s['n_fail']}) "
+        f"| {s['ok_pass@1']:.2%} ({s['ok_correct']}/{s['n_ok']}) "
+        f"| {s['fail18_rescued_count']}/18 \`{s['fail18_rescued']}\` "
+        f"| {s['ceiling_broken_count']}/5 \`{s['ceiling_broken']}\` |"
+    )
+(out / "comparison.md").write_text("\n".join(lines), encoding="utf-8")
+print(f"[merge] {len(all_stats)} ckpts merged \u2192 {out}/comparison.md")
+PY
+        fi
+    else
+        # Serial path (single GPU or only 1 ckpt)
+        local eval_args=(
+            --out_dir "$EVAL_DIR"
+            --gen_length "$EVAL_GEN_LENGTH"
+            --block_length "$EVAL_BLOCK_LENGTH"
+            --temperature "$EVAL_TEMPERATURE"
+            --ckpts "${CKPTS[@]}"
+        )
+        run_or_dry "v1.6.1 eval (serial)" \
+            python scripts/validate/v16_eval.py "${eval_args[@]}"
+    fi
 
     echo
     echo "[CHECK Phase 5]"
