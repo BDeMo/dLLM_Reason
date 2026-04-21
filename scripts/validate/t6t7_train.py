@@ -66,14 +66,18 @@ def parse_args():
                          "prompt (100-300 tok) + cleaned teacher trace "
                          "(~100-500 tok). Bump if seeing 'exceeds max_seq_len'.")
     ap.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                    help="Enable HF gradient checkpointing on the inner "
-                         "LLaDA model. Trades ~20% speed for ~60% activation "
-                         "memory reduction. REQUIRED for 8B full-precision "
-                         "SFT on A100-80GB with batch_size > 0 (otherwise OOM "
-                         "in attention forward).")
+                    help="Try enabling HF gradient checkpointing. LLaDA's "
+                         "remote code doesn't support it — will fail-soft + "
+                         "rely on --use_8bit_adamw for memory savings.")
     ap.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing",
-                    action="store_false",
-                    help="Disable gradient checkpointing (only if you have >80GB GPU).")
+                    action="store_false")
+    ap.add_argument("--use_8bit_adamw", action="store_true", default=True,
+                    help="Replace fp32 AdamW with bitsandbytes AdamW8bit after "
+                         "Finetuner init. Saves ~48 GB per rank on 8B model "
+                         "(the fp32 moments × 2 that blew budget). Requires "
+                         "bitsandbytes installed. Auto-fallback to fp32 if "
+                         "bitsandbytes missing.")
+    ap.add_argument("--no_8bit_adamw", dest="use_8bit_adamw", action="store_false")
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum_steps", type=int, default=4,
@@ -162,26 +166,27 @@ def main():
             n_params += p.numel()
         maybe_print(f"[T6T7] model: {n_params/1e6:.1f}M params, all trainable")
 
-        # Enable gradient checkpointing on the underlying HF model so
-        # activations are re-computed in backward instead of stashed.
-        # Saves ~60% activation memory at ~20% speed cost. Essential for
-        # 8B + bf16 + AdamW fp32 on A100-80GB (model=16G + grads=16G +
-        # optim=64G leaves ~16G for activations, which blows up at
-        # batch_size*seq_len even with attention kernel fusions).
+        # Try to enable gradient checkpointing on the underlying HF model.
+        # LLaDA's remote-code LLaDAModelLM does NOT set
+        # _supports_gradient_checkpointing, so gradient_checkpointing_enable()
+        # raises ValueError. Make it fail-soft and fall back to 8bit AdamW
+        # for the bulk memory savings.
         if args.gradient_checkpointing:
             inner = getattr(model, "_llada", None)
             if inner is not None and hasattr(inner, "gradient_checkpointing_enable"):
-                inner.gradient_checkpointing_enable()
-                # gradient checkpointing + use_cache=True is incompatible
-                if hasattr(inner, "config"):
-                    try:
-                        inner.config.use_cache = False
-                    except Exception:
-                        pass
-                maybe_print(f"[T6T7] gradient_checkpointing_enable() on ._llada ✓")
+                try:
+                    inner.gradient_checkpointing_enable()
+                    if hasattr(inner, "config"):
+                        try: inner.config.use_cache = False
+                        except Exception: pass
+                    maybe_print(f"[T6T7] gradient_checkpointing_enable() ✓")
+                except ValueError as e:
+                    maybe_print(f"[T6T7] model doesn't support gradient "
+                                f"checkpointing ({e})")
+                    maybe_print(f"[T6T7]   will rely on --use_8bit_adamw + bs=1 "
+                                f"to fit memory")
             else:
-                maybe_print(f"[T6T7] WARN: could not enable gradient checkpointing "
-                            f"(no ._llada or missing method). You may OOM.")
+                maybe_print(f"[T6T7] WARN: no ._llada for gradient checkpointing")
 
         # Wrap in DDP if launched via torchrun
         if is_ddp:
@@ -280,6 +285,27 @@ def main():
         )
 
     trainer = Finetuner(model, train_loader, val_loader, cfg)
+
+    # ── Swap fp32 AdamW for bitsandbytes AdamW8bit (save ~48 GB / rank) ──────
+    # LLaDA can't use gradient checkpointing, so this is the main knob for
+    # fitting 8B on A100-80GB. Cosine-with-warm-restarts scheduler is
+    # recreated on the new optimizer.
+    if args.use_8bit_adamw:
+        try:
+            import bitsandbytes as bnb
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+            trainer.optimizer = bnb.optim.AdamW8bit(
+                trainer.model.parameters(), lr=args.lr,
+                betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
+            )
+            trainer.scheduler = CosineAnnealingWarmRestarts(
+                trainer.optimizer, T_0=1000, T_mult=2,
+            )
+            maybe_print(f"[T6T7] swapped to bitsandbytes AdamW8bit ✓ "
+                        f"(saves ~48 GB / rank on 8B model)")
+        except ImportError:
+            maybe_print(f"[T6T7] WARN: bitsandbytes not installed; "
+                        f"sticking with fp32 AdamW. Install: pip install bitsandbytes")
 
     # ── Resume from latest step_*.pt if present in save_dir ──────────────────
     # Finetuner has load_checkpoint(path) that restores model + optimizer +

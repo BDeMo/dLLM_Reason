@@ -10,6 +10,12 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — LLaDA remote code 不支持 gradient_checkpointing_enable
+- `inner._llada.gradient_checkpointing_enable()` 抛 `ValueError: LLaDAModelLM does not support gradient checkpointing`
+- LLaDA 的 modeling_llada.py 没设 `_supports_gradient_checkpointing = True`
+- Fix: GC call fail-soft (try/except ValueError)；换 **bitsandbytes AdamW8bit** 当主节省手段，每 rank 省 ~48 GB optimizer state
+- `--use_8bit_adamw` 默认 True（install bitsandbytes 即可用）
+
 ### [2026-04-21] v1.6.1 — T6 SFT DDP 8B+bf16+AdamW 在 80GB A100 必 OOM
 - 内存账：model weights bf16 ~16G + gradients bf16 ~16G + AdamW fp32 moments 2× ~64G = **96G 只是 optimizer state + weights**，80G A100 直接爆
 - User trace: `OOM in attention forward, 72 MiB needed, 65 MiB free, 79G in use`
