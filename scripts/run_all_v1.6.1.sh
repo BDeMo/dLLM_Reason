@@ -23,6 +23,15 @@
 #   bash scripts/run_all_v1.6.1.sh --from_phase 3   # skip downloads / scope
 #   bash scripts/run_all_v1.6.1.sh --dry_run
 #
+# Multi-GPU summary:
+#   --scope_gpus N   Phase 2 scope regen (default 8). Each GPU runs its
+#                    own serve + client; ~8x speedup vs single GPU.
+#   --t6_gpus N      Phase 3 teacher trace (default 8). Same shard pattern
+#                    as run_t6_shards.sh; ~8x speedup.
+#   T6 SFT (Phase 4) is currently SINGLE GPU. Multi-GPU DDP for the SFT
+#   loop is on the v1.6.2 roadmap. ETA on 1× A100 ≈ 1.5h for 2k samples
+#   × 2000 steps; with multi-output traces (~5k SFT rows) ≈ 2h.
+#
 # Defaults target the "big run" profile the user described:
 #   - Qwen3-8B teacher (compatible with stable transformers 4.x)
 #   - 2000 gsm8k train prompts
@@ -40,6 +49,8 @@ MAX_TRAIN=2000
 MAX_SCOPE_PROMPTS=""               # "" = full gsm8k test (1319)
 T6_GPUS=8
 T6_BATCH_SIZE=8
+SCOPE_GPUS=8                        # multi-GPU scope regen (Phase 2). 1 = single
+EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
 T6_MAX_STEPS=2000
@@ -63,6 +74,8 @@ while [[ $# -gt 0 ]]; do
         --max_scope_prompts)  MAX_SCOPE_PROMPTS="$2"; shift 2 ;;
         --t6_gpus)            T6_GPUS="$2"; shift 2 ;;
         --t6_batch_size)      T6_BATCH_SIZE="$2"; shift 2 ;;
+        --scope_gpus)         SCOPE_GPUS="$2"; shift 2 ;;
+        --eval_gpus)          EVAL_GPUS="$2"; shift 2 ;;
         --t6_retries)         T6_RETRIES="$2"; shift 2 ;;
         --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
         --t6_max_steps)       T6_MAX_STEPS="$2"; shift 2 ;;
@@ -130,6 +143,7 @@ cat <<EOF
   TEACHER_CKPT      = $TEACHER_CKPT
   MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
   MAX_SCOPE         = ${MAX_SCOPE_PROMPTS:-"all 1319"} (gsm8k test, for scope regen)
+  SCOPE_GPUS        = $SCOPE_GPUS  (Phase 2 multi-GPU; 1 = single via Phase-1 serve)
   T6_GPUS           = $T6_GPUS
   T6_BATCH_SIZE     = $T6_BATCH_SIZE  (HF pipeline batching per shard)
   T6_RETRIES        = $T6_RETRIES  (v1.6.1: multi-output via T>0 + retries)
@@ -178,6 +192,13 @@ trap cleanup_serve EXIT INT TERM
 phase_1() {
     hdr "Phase 1 — Start LLaDA serve on port $SERVER_PORT"
 
+    # If scope regen will use its own multi-GPU shards (each spinning its
+    # own serve), this Phase-1 serve is redundant. Skip.
+    if [[ "$SCOPE_GPUS" -gt 1 ]]; then
+        echo "[PHASE 1] SCOPE_GPUS=$SCOPE_GPUS > 1 \u2192 Phase-2 spins its own serves, skipping Phase-1 serve"
+        return 0
+    fi
+
     # Reuse if already up
     if curl -sf "$SERVER_URL/health" > /dev/null 2>&1; then
         echo "[PHASE 1] serve already running at $SERVER_URL, reusing"
@@ -211,20 +232,34 @@ phase_1() {
 #  PHASE 2 — Regenerate scope_fail + scope_ok from gsm8k test
 # ═════════════════════════════════════════════════════════════════════════════
 phase_2() {
-    hdr "Phase 2 — Regenerate scope (baseline canonical eval on gsm8k test)"
+    hdr "Phase 2 — Regenerate scope ($SCOPE_GPUS-GPU, gsm8k test → scope_fail/ok)"
 
-    local regen_args=(
-        --server_url "$SERVER_URL"
-        --mirror "$MIRROR"
-        --gen_length 128
-        --block_length 32
-        --temperature 0
-    )
-    [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
-        regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
-
-    run_or_dry "Regenerate scope (gsm8k test → scope_fail/ok)" \
-        python scripts/validate/regen_scope.py "${regen_args[@]}"
+    if [[ "$SCOPE_GPUS" -gt 1 ]]; then
+        # Multi-GPU shards (each GPU runs its own serve + client; uses
+        # ports BASE_PORT+1 onwards to avoid colliding with Phase-1 serve)
+        local regen_args=(
+            --gpus "$SCOPE_GPUS"
+            --base_port "$((SERVER_PORT + 100))"
+            --mirror "$MIRROR"
+        )
+        [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
+            regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
+        run_or_dry "Regenerate scope ($SCOPE_GPUS-GPU shard)" \
+            bash scripts/run_regen_scope_shards.sh "${regen_args[@]}"
+    else
+        # Single-GPU via the Phase-1 serve
+        local regen_args=(
+            --server_url "$SERVER_URL"
+            --mirror "$MIRROR"
+            --gen_length 128
+            --block_length 32
+            --temperature 0
+        )
+        [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
+            regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
+        run_or_dry "Regenerate scope (single-GPU via Phase-1 serve)" \
+            python scripts/validate/regen_scope.py "${regen_args[@]}"
+    fi
 
     echo
     echo "[CHECK Phase 2]"
