@@ -60,14 +60,71 @@ DEFAULT_FAIL = OUT_BASE / "scope_fail_prompts.json"
 DEFAULT_OK = OUT_BASE / "scope_ok_prompts.json"
 
 
-def load_gsm8k_test(max_prompts: int | None, mirror: str | None) -> list[dict]:
-    apply_mirror(mirror)
+def load_gsm8k_test(max_prompts: int | None, mirror: str | None,
+                    local_path: str | None = None,
+                    offline: bool = False) -> list[dict]:
+    """Load gsm8k test prompts.
+
+    Resolution order (network-cheapest first):
+      1. ``local_path`` JSON (e.g. runs/validation/gsm8k_test_prompts.json) —
+         no HF call, fully offline. PREFERRED for re-runs / mirror outages.
+      2. HF cache only (``offline=True``): set HF_DATASETS_OFFLINE=1 so
+         load_dataset reuses the prior download without verifying
+         the hub. Fails if dataset isn't already cached locally.
+      3. HF + mirror (default): apply HF_ENDPOINT, call load_dataset.
+    """
+    # Path 1: explicit local JSON (no HF involvement)
+    if local_path and Path(local_path).is_file():
+        print(f"[REGEN] loading gsm8k test from local JSON: {local_path}")
+        data = json.loads(Path(local_path).read_text(encoding="utf-8"))
+        if max_prompts:
+            data = data[:max_prompts]
+        out = []
+        for i, item in enumerate(data):
+            # Accept either {prompt, ground_truth} (our scope schema) or
+            # {question, answer} (raw HF schema).
+            if "prompt" in item and "ground_truth" in item:
+                out.append({
+                    "source_idx": item.get("source_idx", i),
+                    "prompt": item["prompt"],
+                    "ground_truth": item["ground_truth"],
+                })
+            else:
+                gt = _gsm_extract_gt(item.get("answer", ""))
+                if gt is None:
+                    continue
+                out.append({
+                    "source_idx": i,
+                    "prompt": item["question"],
+                    "ground_truth": gt,
+                })
+        print(f"[REGEN] loaded {len(out)} prompts from local")
+        return out
+
+    # Path 2 + 3: HF, with optional offline / mirror
+    if offline:
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        print(f"[REGEN] HF_DATASETS_OFFLINE=1 — using HF cache only")
+    else:
+        apply_mirror(mirror)
+
+    # Project-first: prefer datasets/gsm8k/test/ (registered local cache)
+    # before falling back to HF download.
+    sys.path.insert(0, str(ROOT / "src"))
     try:
-        from datasets import load_dataset
+        from dllm_reason.utils.local_resolve import resolve_dataset
+        print(f"[REGEN] resolving via project registry "
+              f"(datasets/gsm8k/test/ first)")
+        ds = resolve_dataset("openai/gsm8k", config="main", split="test")
     except ImportError:
-        print("[REGEN] ERROR: pip install datasets", file=sys.stderr)
-        sys.exit(1)
-    ds = load_dataset("openai/gsm8k", "main", split="test")
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            print("[REGEN] ERROR: pip install datasets", file=sys.stderr)
+            sys.exit(1)
+        ds = load_dataset("openai/gsm8k", "main", split="test")
     print(f"[REGEN] gsm8k test loaded: {len(ds)}")
     if max_prompts:
         ds = ds.select(range(min(max_prompts, len(ds))))
@@ -102,6 +159,17 @@ def main():
                     help="cap #prompts (default: full gsm8k test = 1319)")
     ap.add_argument("--mirror", type=str, default=None,
                     help="HF endpoint: default / hf-mirror / modelscope / URL")
+    ap.add_argument("--gsm8k_test_path", type=str, default=None,
+                    help="Skip HF entirely; load gsm8k test from this local JSON. "
+                         "Schema: list of {prompt, ground_truth} OR raw "
+                         "{question, answer} HF format. Use this when network "
+                         "/ mirror is down. Generate via: "
+                         "python load_gsm8k_train.py --split test "
+                         "--output runs/validation/gsm8k_test_prompts.json")
+    ap.add_argument("--offline", action="store_true",
+                    help="Force HF cache-only mode (HF_DATASETS_OFFLINE=1). "
+                         "Use this when first download succeeded but mirror "
+                         "is now flaky. Fails if dataset not previously cached.")
     # Sharding
     ap.add_argument("--prompt_start", type=int, default=None)
     ap.add_argument("--prompt_end", type=int, default=None)
@@ -118,7 +186,11 @@ def main():
     if args.num_steps is None:
         args.num_steps = args.gen_length
 
-    prompts_all = load_gsm8k_test(args.max_prompts, args.mirror)
+    prompts_all = load_gsm8k_test(
+        args.max_prompts, args.mirror,
+        local_path=args.gsm8k_test_path,
+        offline=args.offline,
+    )
 
     # Apply shard slice for work (but always aggregate from all)
     if args.prompt_start is not None or args.prompt_end is not None:

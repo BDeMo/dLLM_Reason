@@ -101,6 +101,10 @@ def main():
     ap.add_argument("--output", type=str, default=str(DEFAULT_OUT))
     ap.add_argument("--mirror", type=str, default=None,
                     help="HF endpoint: default / hf-mirror / modelscope / URL")
+    ap.add_argument("--offline", action="store_true",
+                    help="Force HF cache-only (HF_DATASETS_OFFLINE=1). Use "
+                         "after a prior successful download to avoid re-pinging "
+                         "the hub on flaky-mirror days.")
     ap.add_argument("--check_only", action="store_true",
                     help="only verify existing output file; skip download")
     ap.add_argument("--overwrite", action="store_true",
@@ -128,17 +132,28 @@ def main():
         for iss in issues:
             print(f"    - {iss}")
 
-    apply_mirror(args.mirror)
+    if args.offline:
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        print(f"[GSM8K] HF_DATASETS_OFFLINE=1 — using HF cache only")
+    else:
+        apply_mirror(args.mirror)
 
-    # Load from HF
+    # Try project-registered local-first resolver (datasets/gsm8k/<split>/)
+    # before falling back to HF download. Honors MODEL_REGISTRY in
+    # src/dllm_reason/utils/resource_registry.py.
+    sys.path.insert(0, str(ROOT / "src"))
     try:
-        from datasets import load_dataset
+        from dllm_reason.utils.local_resolve import resolve_dataset
+        print(f"[GSM8K] resolving via project registry "
+              f"(datasets/gsm8k/{args.split}/ first; HF fallback)")
+        ds = resolve_dataset("openai/gsm8k", config="main", split=args.split)
     except ImportError:
-        print("[GSM8K] ERROR: pip install datasets", file=sys.stderr)
-        sys.exit(1)
+        from datasets import load_dataset
+        print(f"[GSM8K] dllm_reason not importable; loading via HF directly")
+        ds = load_dataset("openai/gsm8k", "main", split=args.split)
 
-    print(f"[GSM8K] loading openai/gsm8k (split={args.split}) ...")
-    ds = load_dataset("openai/gsm8k", "main", split=args.split)
     print(f"[GSM8K] loaded: {len(ds)} items")
 
     if args.max_samples:

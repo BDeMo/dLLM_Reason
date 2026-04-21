@@ -19,6 +19,8 @@ MAX_PROMPTS=""                 # "" = full gsm8k test (1319)
 MIRROR="default"
 RUN_DIR=""
 DRY_RUN=0
+GSM8K_TEST_PATH=""             # local JSON; if set, skip HF entirely
+OFFLINE=0                      # HF cache-only mode
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,6 +28,8 @@ while [[ $# -gt 0 ]]; do
         -p|--base_port)    BASE_PORT="$2";    shift 2 ;;
         --max_prompts)     MAX_PROMPTS="$2";  shift 2 ;;
         --mirror)          MIRROR="$2";       shift 2 ;;
+        --gsm8k_test_path) GSM8K_TEST_PATH="$2"; shift 2 ;;
+        --offline)         OFFLINE=1;         shift ;;
         -r|--run_dir)      RUN_DIR="$2";      shift 2 ;;
         --dry_run)         DRY_RUN=1;         shift ;;
         -h|--help)         grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -51,14 +55,20 @@ echo "[REGEN-SH] MIRROR       = $MIRROR"
 echo "[REGEN-SH] RUN_DIR      = $RUN_DIR"
 echo "[REGEN-SH]"
 
-# ── Compute total prompts ─────────────────────────────────────────────────────
+# ── Compute total prompts (prefer local JSON over HF) ────────────────────────
 TOTAL=$(python - <<PY
-from datasets import load_dataset
-import os
-os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
-ds = load_dataset("openai/gsm8k", "main", split="test")
-n = len(ds)
+import os, json
+local = "$GSM8K_TEST_PATH"
 m = "$MAX_PROMPTS"
+if local and os.path.isfile(local):
+    n = len(json.load(open(local)))
+else:
+    if "$OFFLINE" == "1":
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
+    from datasets import load_dataset
+    n = len(load_dataset("openai/gsm8k", "main", split="test"))
 if m: n = min(n, int(m))
 print(n)
 PY

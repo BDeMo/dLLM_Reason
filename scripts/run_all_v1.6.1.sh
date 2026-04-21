@@ -23,6 +23,21 @@
 #   bash scripts/run_all_v1.6.1.sh --from_phase 3   # skip downloads / scope
 #   bash scripts/run_all_v1.6.1.sh --dry_run
 #
+# Local-first / offline mode:
+#   The pipeline uses dllm_reason.utils.local_resolve under the hood, which
+#   prefers project-registered local paths (checkpoints/llada-instruct/,
+#   datasets/gsm8k/) over HF downloads. This works automatically — no flag
+#   needed — as long as the registered local paths exist.
+#
+#   Extra flags for fully-offline / mirror-down scenarios:
+#     --offline                Set HF_DATASETS_OFFLINE=1 and TRANSFORMERS_
+#                              OFFLINE=1; uses HF cache only. Fails if
+#                              dataset/model not previously cached.
+#     --gsm8k_test_local PATH  Skip HF entirely for scope regen by reading
+#                              gsm8k test from a local JSON file (e.g.
+#                              runs/validation/gsm8k_test_prompts.json
+#                              produced by load_gsm8k_train.py --split test).
+#
 # Multi-GPU summary (all phases now parallelizable):
 #   --scope_gpus N   Phase 2 scope regen (default 8). Each GPU runs its
 #                    own serve + client; ~8× speedup.
@@ -57,6 +72,8 @@ T6_BATCH_SIZE=8
 SCOPE_GPUS=8                        # multi-GPU scope regen (Phase 2). 1 = single
 SFT_GPUS=8                          # multi-GPU T6 SFT via torchrun DDP. 1 = single
 EVAL_GPUS=1                         # parallel ckpt eval (Phase 5). 1 = serial
+OFFLINE=0                           # 1 = HF cache-only (HF_DATASETS_OFFLINE=1)
+GSM8K_TEST_LOCAL=""                 # path to local gsm8k test JSON (skip HF)
 T6_RETRIES=5                       # ↑ from 3: more diverse attempts/prompt
 T6_TEMPERATURE=0.7                 # > 0 so retries give different outputs
 T6_MAX_STEPS=2000
@@ -83,6 +100,8 @@ while [[ $# -gt 0 ]]; do
         --scope_gpus)         SCOPE_GPUS="$2"; shift 2 ;;
         --sft_gpus)           SFT_GPUS="$2"; shift 2 ;;
         --eval_gpus)          EVAL_GPUS="$2"; shift 2 ;;
+        --offline)            OFFLINE=1; shift ;;
+        --gsm8k_test_local)   GSM8K_TEST_LOCAL="$2"; shift 2 ;;
         --t6_retries)         T6_RETRIES="$2"; shift 2 ;;
         --t6_temperature)     T6_TEMPERATURE="$2"; shift 2 ;;
         --t6_max_steps)       T6_MAX_STEPS="$2"; shift 2 ;;
@@ -145,7 +164,8 @@ check_file() {
 hdr "v1.6.1 Pipeline — Run All"
 cat <<EOF
   ROOT              = $ROOT
-  MIRROR            = $MIRROR
+  MIRROR            = $MIRROR  (OFFLINE=$OFFLINE)
+  GSM8K_TEST_LOCAL  = ${GSM8K_TEST_LOCAL:-"(use registered datasets/gsm8k/)"}
   TEACHER_SIZE      = $TEACHER_SIZE
   TEACHER_CKPT      = $TEACHER_CKPT
   MAX_TRAIN (T6 src)= $MAX_TRAIN (gsm8k train)
@@ -172,9 +192,14 @@ phase_0() {
     run_or_dry "Download Qwen teacher ($TEACHER_SIZE)" \
         python scripts/download_qwen.py \
         --sizes "$TEACHER_SIZE" --mirror "$MIRROR"
+    local gsm_args=(--max_samples "$MAX_TRAIN")
+    if [[ "$OFFLINE" -eq 1 ]]; then
+        gsm_args+=(--offline)
+    else
+        gsm_args+=(--mirror "$MIRROR")
+    fi
     run_or_dry "Load gsm8k train prompts (max $MAX_TRAIN)" \
-        python scripts/validate/load_gsm8k_train.py \
-        --mirror "$MIRROR" --max_samples "$MAX_TRAIN"
+        python scripts/validate/load_gsm8k_train.py "${gsm_args[@]}"
 
     echo
     echo "[CHECK Phase 0]"
@@ -244,29 +269,33 @@ phase_2() {
     hdr "Phase 2 — Regenerate scope ($SCOPE_GPUS-GPU, gsm8k test → scope_fail/ok)"
 
     if [[ "$SCOPE_GPUS" -gt 1 ]]; then
-        # Multi-GPU shards (each GPU runs its own serve + client; uses
-        # ports BASE_PORT+1 onwards to avoid colliding with Phase-1 serve)
+        # Multi-GPU shards
         local regen_args=(
             --gpus "$SCOPE_GPUS"
             --base_port "$((SERVER_PORT + 100))"
-            --mirror "$MIRROR"
         )
+        [[ "$OFFLINE" -eq 1 ]] && regen_args+=(--offline) \
+                              || regen_args+=(--mirror "$MIRROR")
+        [[ -n "$GSM8K_TEST_LOCAL" ]] && \
+            regen_args+=(--gsm8k_test_path "$GSM8K_TEST_LOCAL")
         [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
             regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
         run_or_dry "Regenerate scope ($SCOPE_GPUS-GPU shard)" \
             bash scripts/run_regen_scope_shards.sh "${regen_args[@]}"
     else
-        # Single-GPU via the Phase-1 serve
         local regen_args=(
             --server_url "$SERVER_URL"
-            --mirror "$MIRROR"
             --gen_length 128
             --block_length 32
             --temperature 0
         )
+        [[ "$OFFLINE" -eq 1 ]] && regen_args+=(--offline) \
+                              || regen_args+=(--mirror "$MIRROR")
+        [[ -n "$GSM8K_TEST_LOCAL" ]] && \
+            regen_args+=(--gsm8k_test_path "$GSM8K_TEST_LOCAL")
         [[ -n "$MAX_SCOPE_PROMPTS" ]] && \
             regen_args+=(--max_prompts "$MAX_SCOPE_PROMPTS")
-        run_or_dry "Regenerate scope (single-GPU via Phase-1 serve)" \
+        run_or_dry "Regenerate scope (single-GPU)" \
             python scripts/validate/regen_scope.py "${regen_args[@]}"
     fi
 
