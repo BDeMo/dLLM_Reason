@@ -281,13 +281,18 @@ def main():
           f"g={args.gen_length} steps={args.num_steps} "
           f"rem={args.remasking}")
 
-    def prompt_key(i: int) -> str:
-        return f"t{i:04d}"
+    # CRITICAL: key must be the GLOBAL gsm8k-test index (source_idx),
+    # NOT the local position in this shard's `prompts` slice. Otherwise
+    # all 8 shards write t0000.json simultaneously → race on the
+    # .json.tmp atomic-rename → FileNotFoundError when one rename runs
+    # while another shard's tmp gets stolen.
+    def prompt_key(source_idx: int) -> str:
+        return f"t{source_idx:04d}"
 
     def is_done(key: str) -> bool:
         return (rd.per_prompt / f"{key}.json").exists()
 
-    todo = [(i, p) for (i, p) in enumerate(prompts) if not is_done(prompt_key(i))]
+    todo = [rec for rec in prompts if not is_done(prompt_key(rec["source_idx"]))]
     print(f"[REGEN] done={len(prompts) - len(todo)}  todo={len(todo)}")
 
     if args.dry_run:
@@ -299,9 +304,9 @@ def main():
     api.check_health()
 
     pp = ProgressPrinter(len(todo), tag="REGEN ")
-    for i, rec in todo:
+    for rec in todo:
         prompt, gt = rec["prompt"], rec["ground_truth"]
-        key = prompt_key(i)
+        key = prompt_key(rec["source_idx"])
         t0 = time.time()
         try:
             out = api.generate(
@@ -340,9 +345,12 @@ def main():
         return
 
     # ── Aggregate: split all per_prompt into fail + ok ───────────────────────
+    # Iterate prompts_all (full set) and look up by source_idx so the
+    # aggregator finds files written by ALL shards regardless of which
+    # slice they handled.
     all_recs = []
-    for i in range(len(prompts_all)):
-        p = rd.per_prompt / f"{prompt_key(i)}.json"
+    for item in prompts_all:
+        p = rd.per_prompt / f"{prompt_key(item['source_idx'])}.json"
         if p.exists():
             all_recs.append(json.loads(p.read_text(encoding="utf-8")))
 

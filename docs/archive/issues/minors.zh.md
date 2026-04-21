@@ -10,6 +10,12 @@
 
 ## 2026-04 v1.6.x
 
+### [2026-04-21] v1.6.1 — `regen_scope.py` shard race on per_prompt key
+- `prompt_key(i)` 用的是 `enumerate(prompts)` 的本地 i，而 `prompts` 是分片切完的子集 → 8 个 shard **全部从 `t0000` 开始**
+- 所有 shard 写 `per_prompt/t0000.json.tmp` 互抢 → 一个 `os.replace(tmp, .json)` 后另一个找不到 tmp → `FileNotFoundError: ... t0000.json.tmp`
+- 数据互相覆盖；最终 `scope_fail/ok` 缺失大半
+- Fix: `prompt_key` 改用 `rec["source_idx"]`（全局 gsm8k test 索引），所有 shard 写不同 key；aggregate 也按 source_idx 聚合
+
 ### [2026-04-21] v1.6.1 — `run_regen_scope_shards.sh` prompt counter 用 `load_dataset` 触发 HF
 - bash 启动时 `TOTAL=$(python heredoc { load_dataset("openai/gsm8k") })` 即使本地有 `datasets/gsm8k/test/dataset_info.json` 也会先 ping HF 验 metadata
 - User: "为什么要访问 huggingface.co" + "datasets/gsm8k/test/ 存在啊" + "dataset_info.json 也存在啊"
@@ -64,6 +70,18 @@
 - Fix: 显式 `for p in model.parameters(): p.requires_grad_(True)`，commit `c8b17d7`
 
 ---
+
+## Sharded-write 写法 checklist（防 race）
+
+写新 sharded 脚本前，对照以下检查避免 v1.6.1 出现过的 t0000 race：
+
+1. **每个 shard 写不同 path** —— per-prompt key 必须用**全局唯一**索引（gsm8k 用 `source_idx`，scope_fail/ok 用 `(group, idx)` 中的 `idx` 必须是全局的，不是 enumerate(slice) 局部的）
+2. **`enumerate(prompts)` 后才 slice** —— 永远先 enumerate 完整列表，后切片，让原始 index 跟着 tuple 走
+3. **聚合时按全局 key 找文件** —— iterate `prompts_full` 而不是 `prompts`，否则 missing 半数据
+4. **`load_dataset` 不在 bash heredoc 里调** —— 永远用 `load_from_disk` / parquet / json，HF 网络永不在 hot path
+5. **export `HF_HUB_OFFLINE=1` HF_DATASETS_OFFLINE=1` TRANSFORMERS_OFFLINE=1`** —— 任何 sharded scope/data-prep 脚本顶部统一设
+6. **`os.replace(tmp, path)` 前确认 tmp 存在** —— 写 race 之外，磁盘满 / 权限错也会触发；至少 try/except 加 print
+7. **空数组 wait 守卫** —— `if [[ ${#PIDS[@]} -eq 0 ]]; then ... fi` 防 `wait ""` 报 not-a-pid
 
 ## 格式与规则
 
