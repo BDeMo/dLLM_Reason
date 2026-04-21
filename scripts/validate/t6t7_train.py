@@ -126,8 +126,23 @@ def main():
         model = None
     else:
         maybe_print(f"[T6T7] loading model: {args.init_ckpt}")
+        # In DDP mode: force each rank to load the FULL model on its own
+        # single GPU. Vanilla device_map='auto' makes each of the 8 ranks
+        # spread the 8B params across all 8 visible GPUs → 8× waste +
+        # cross-rank aliasing + OOM. Use device_map={"": local_rank} so
+        # the entire model lands on cuda:local_rank.
+        #
+        # (Setting CUDA_VISIBLE_DEVICES here would be too late — torch.cuda
+        # has already initialized inside init_process_group above. The dict
+        # device_map is the reliable path.)
+        if is_ddp:
+            load_kwargs = {"device_map": {"": local_rank}}
+            maybe_print(f"[T6T7] DDP: rank {local_rank} loads model on cuda:{local_rank}")
+        else:
+            load_kwargs = {"device_map": "auto"}
         model = LLaDAWrapper(model_id=args.init_ckpt,
-                             max_seq_len=args.max_seq_len)
+                             max_seq_len=args.max_seq_len,
+                             **load_kwargs)
         tokenizer = model.tokenizer
 
         # Ensure all parameters require grad + model is in train mode.
@@ -154,7 +169,8 @@ def main():
                     except AttributeError:
                         return getattr(self.module, name)
 
-            model = model.to(f"cuda:{local_rank}")
+            # Model already on cuda:local_rank from load_kwargs above;
+            # no explicit .to() needed. DDP just wraps.
             model = TransparentDDP(model, device_ids=[local_rank],
                                    find_unused_parameters=False)
             maybe_print(f"[T6T7] wrapped in TransparentDDP on cuda:{local_rank}")
