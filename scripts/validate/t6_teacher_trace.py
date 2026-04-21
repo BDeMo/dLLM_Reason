@@ -93,6 +93,47 @@ Problem: {prompt}"""
 
 SECTION_RE = re.compile(r"<(SETUP|STEP_\d+|ANSWER)>(.*?)</\1>", re.DOTALL)
 
+# Matches a full <SETUP>...</SETUP> (<STEP_N>...</STEP_N>)* <ANSWER>...</ANSWER>
+# span. Used to strip Qwen chat-template noise from raw traces at save time
+# (the same regex lives in t6_clean_jsonl.py for post-hoc cleaning).
+CLEAN_SPAN_RE = re.compile(
+    r"<SETUP>.*?</SETUP>(?:\s*<STEP_\d+>.*?</STEP_\d+>)*\s*<ANSWER>(.*?)</ANSWER>",
+    re.DOTALL,
+)
+
+
+def clean_trace(raw: str, gt: str) -> tuple[str, bool]:
+    """Strip chat-template / thinking-block noise from a raw teacher trace.
+
+    Rationale:
+        Qwen3-8B via HF pipeline + instruct chat template emits an internal
+        thinking trace (with <|system|>, <|end|>, </s> markers) BEFORE the
+        final structured output, and sometimes duplicates the structured
+        section. Training LLaDA on raw targets pollutes it with Qwen-specific
+        tokens and duplicate patterns.
+
+    Strategy:
+        1. Find all <SETUP>...</SETUP>(<STEP_N>...</STEP_N>)*<ANSWER>...</ANSWER>
+           spans in the raw text.
+        2. Prefer the LAST match whose <ANSWER> equals ground truth.
+        3. Fall back to the last span if none matches gt exactly.
+        4. If no valid span at all, return raw unchanged.
+
+    Returns (clean_text, was_cleaned). Consumers should use clean_text as
+    the canonical trace for scoring + storage; keep raw in a 'raw_trace'
+    field only if debug is enabled.
+    """
+    matches = list(CLEAN_SPAN_RE.finditer(raw))
+    if not matches:
+        return raw, False
+    # Prefer last gt-matching
+    for m in reversed(matches):
+        ans = m.group(1).strip()
+        if is_correct(ans, gt):
+            return m.group(0), True
+    # Fall back to last span (best-effort)
+    return matches[-1].group(0), True
+
 
 def parse_sections(text: str) -> dict[str, list[int]]:
     """Extract {tag_name: [start_char, end_char]} mappings from a tagged trace.
@@ -330,7 +371,12 @@ def _trace_is_accepted(ans_ok: bool, sections: dict) -> bool:
 
 def run_serial(args, todo, rd, pp, prompt_key):
     """Legacy per-prompt sequential path. Used for api backends + local
-    with batch_size=1."""
+    with batch_size=1.
+
+    Applies clean_trace() to the raw teacher output so per_prompt/*.json
+    stores the canonical clean span. Raw trace preserved under 'raw_trace'
+    when debug is useful.
+    """
     teacher_model = getattr(args, args.teacher + "_model")
     for group, idx, rec in todo:
         prompt, gt = rec["prompt"], rec["ground_truth"]
@@ -340,15 +386,18 @@ def run_serial(args, todo, rd, pp, prompt_key):
         accepted_trace = None
         for attempt in range(args.retries_per_prompt):
             try:
-                trace = query_teacher(args, prompt)
+                raw_trace = query_teacher(args, prompt)
             except Exception as e:
                 print(f"[T6] WARN: teacher error at {key} attempt {attempt}: {e}")
                 time.sleep(1.0)
                 continue
 
+            # Strip Qwen chat-template noise / duplicate sections BEFORE scoring.
+            trace, was_cleaned = clean_trace(raw_trace, gt)
             ans, ans_ok, sections = _score_trace(trace, gt)
             attempts.append({
-                "attempt": attempt, "trace": trace,
+                "attempt": attempt, "trace": trace, "raw_trace": raw_trace,
+                "was_cleaned": was_cleaned,
                 "teacher_answer": ans, "teacher_answer_correct": ans_ok,
                 "sections": sections,
             })
@@ -415,12 +464,16 @@ def run_batched_local(args, todo, rd, pp, prompt_key):
                 continue
 
             # Score each output in the chunk and update state
-            for k, trace in zip(chunk_keys, traces):
+            for k, raw_trace in zip(chunk_keys, traces):
                 (group, idx, rec) = prompt_by_key[k]
                 gt = rec["ground_truth"]
+                # Strip chat-template noise / duplicate sections in-place so
+                # what's saved is already clean.
+                trace, was_cleaned = clean_trace(raw_trace, gt)
                 ans, ans_ok, sections = _score_trace(trace, gt)
                 attempts_by_key[k].append({
-                    "attempt": round_i, "trace": trace,
+                    "attempt": round_i, "trace": trace, "raw_trace": raw_trace,
+                    "was_cleaned": was_cleaned,
                     "teacher_answer": ans, "teacher_answer_correct": ans_ok,
                     "sections": sections,
                 })
@@ -581,11 +634,20 @@ def main():
             f.write(json.dumps(sft_pair, ensure_ascii=False) + "\n")
 
     n_accepted = sum(1 for r in all_recs if r["accepted"])
+    # Cleaning stats: how many accepted traces were stripped of chat-template
+    # noise during generation.
+    n_cleaned = sum(
+        1 for r in all_recs
+        if r.get("accepted_trace") and r["accepted_trace"].get("was_cleaned")
+    )
+
     summary = {
         "n_prompts": len(all_recs),
         "n_accepted": n_accepted,
         "cover_rate": n_accepted / max(len(all_recs), 1),
         "sft_pairs_written": n_accepted,
+        "n_traces_cleaned": n_cleaned,
+        "clean_rate": n_cleaned / max(n_accepted, 1),
         "out_jsonl": str(out_path),
     }
     rd.write_summary(summary)
@@ -594,6 +656,9 @@ def main():
     print("═" * 60)
     print(f"[T6] accepted: {n_accepted}/{len(all_recs)} "
           f"({n_accepted / max(len(all_recs), 1):.2%})")
+    print(f"[T6] cleaned:  {n_cleaned}/{n_accepted} "
+          f"({n_cleaned / max(n_accepted, 1):.2%} of accepted traces had "
+          f"chat-template noise stripped at save time)")
     print(f"[T6] SFT pairs → {out_path}")
     print(f"[T6] summary   → {rd.summary_path}")
 
