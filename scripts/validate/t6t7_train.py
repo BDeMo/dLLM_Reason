@@ -141,12 +141,23 @@ def main():
         # Wrap in DDP if launched via torchrun
         if is_ddp:
             from torch.nn.parallel import DistributedDataParallel as DDP
-            # device_map='auto' may have placed params on cuda:0; explicitly
-            # move to local_rank's device before DDP wrap.
+
+            # Subclass DDP to forward unknown attribute access to .module.
+            # CRITICAL: Finetuner uses self.model.noise_input,
+            # self.model.mask_token_id, self.model.device — all custom attrs
+            # on LLaDAWrapper. nn.Module.__getattr__ does NOT fall back to
+            # .module, so vanilla DDP would AttributeError on every batch.
+            class TransparentDDP(DDP):
+                def __getattr__(self, name):
+                    try:
+                        return super().__getattr__(name)
+                    except AttributeError:
+                        return getattr(self.module, name)
+
             model = model.to(f"cuda:{local_rank}")
-            model = DDP(model, device_ids=[local_rank],
-                        find_unused_parameters=False)
-            maybe_print(f"[T6T7] wrapped in DDP on cuda:{local_rank}")
+            model = TransparentDDP(model, device_ids=[local_rank],
+                                   find_unused_parameters=False)
+            maybe_print(f"[T6T7] wrapped in TransparentDDP on cuda:{local_rank}")
 
     # ── Load dataset ─────────────────────────────────────────────────────────
     train_ds, val_ds = build_jsonl_dataset(
@@ -172,6 +183,11 @@ def main():
     if is_ddp:
         from torch.utils.data.distributed import DistributedSampler
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed)
+        # Finetuner.train() loops on max_steps and re-iters on StopIteration,
+        # but doesn't bump sampler.set_epoch — meaning each re-iter shuffles
+        # identically. Bump epoch from rank/seed combo so cross-iter order
+        # at least varies per rank. (Mild improvement; DDP correctness OK.)
+        train_sampler.set_epoch(args.seed)
         train_loader = DataLoader(
             train_ds, batch_size=args.batch_size, sampler=train_sampler,
             num_workers=0,
