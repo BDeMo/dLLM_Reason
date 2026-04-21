@@ -340,15 +340,28 @@ def load_prompts_for_t6(
 
 def _write_per_prompt(rd, key: str, group: str, idx, gt: str, prompt: str,
                       teacher: str, teacher_model: str,
-                      attempts: list, accepted_trace: dict | None) -> None:
-    """Atomic write of one per_prompt json."""
+                      attempts: list,
+                      accepted_traces: list | None = None,
+                      accepted_trace: dict | None = None) -> None:
+    """Atomic write of one per_prompt json.
+
+    v1.6.1 additions:
+      accepted_traces — list of ALL valid attempts (multi-output mode).
+      accepted_trace  — legacy first-valid, kept for back-compat.
+    Exactly one of the two should be non-empty.
+    """
     import os
+    if accepted_traces is None:
+        accepted_traces = [accepted_trace] if accepted_trace else []
     rec_out = {
         "group": group, "idx": idx, "gt": gt, "prompt": prompt,
         "teacher": teacher, "teacher_model": teacher_model,
-        "accepted": accepted_trace is not None,
+        "accepted": len(accepted_traces) > 0,
+        "n_accepted_traces": len(accepted_traces),
         "attempts": attempts,
-        "accepted_trace": accepted_trace,
+        "accepted_traces": accepted_traces,
+        # Back-compat: first accepted under old field name
+        "accepted_trace": accepted_traces[0] if accepted_traces else None,
     }
     path = rd.per_prompt / f"{key}.json"
     tmp = path.with_suffix(".json.tmp")
@@ -373,17 +386,18 @@ def run_serial(args, todo, rd, pp, prompt_key):
     """Legacy per-prompt sequential path. Used for api backends + local
     with batch_size=1.
 
-    Applies clean_trace() to the raw teacher output so per_prompt/*.json
-    stores the canonical clean span. Raw trace preserved under 'raw_trace'
-    when debug is useful.
+    v1.6.1: collects ALL valid traces per prompt (multi-output mode) unless
+    --first_valid_only is passed. Combined with temperature>0 + multiple
+    retries, gives diverse correct traces per prompt → more SFT data.
     """
     teacher_model = getattr(args, args.teacher + "_model")
+    first_only = args.first_valid_only
     for group, idx, rec in todo:
         prompt, gt = rec["prompt"], rec["ground_truth"]
         key = prompt_key(group, idx)
 
         attempts = []
-        accepted_trace = None
+        accepted_traces: list = []
         for attempt in range(args.retries_per_prompt):
             try:
                 raw_trace = query_teacher(args, prompt)
@@ -402,15 +416,19 @@ def run_serial(args, todo, rd, pp, prompt_key):
                 "sections": sections,
             })
             if _trace_is_accepted(ans_ok, sections):
-                accepted_trace = attempts[-1]
-                break
+                # De-dup: drop if identical to an already-accepted trace
+                if not any(a["trace"] == trace for a in accepted_traces):
+                    accepted_traces.append(attempts[-1])
+                if first_only:
+                    break
             if args.sleep_ms:
                 time.sleep(args.sleep_ms / 1000.0)
 
         _write_per_prompt(rd, key, group, idx, gt, prompt,
                           args.teacher, teacher_model,
-                          attempts, accepted_trace)
-        pp.tick(f"{key} {'✓' if accepted_trace else '✗'}")
+                          attempts, accepted_traces=accepted_traces)
+        status = f"✓×{len(accepted_traces)}" if accepted_traces else "✗"
+        pp.tick(f"{key} {status}")
 
 
 def run_batched_local(args, todo, rd, pp, prompt_key):
@@ -426,14 +444,17 @@ def run_batched_local(args, todo, rd, pp, prompt_key):
 
     # Per-key state: attempts accumulated, accepted trace (or None)
     attempts_by_key: dict[str, list] = {}
-    accepted_by_key: dict[str, dict | None] = {}
-    prompt_by_key: dict[str, tuple] = {}   # key -> (group, idx, rec)
+    accepted_by_key: dict[str, list] = {}  # list of valid traces (multi-output)
+    prompt_by_key: dict[str, tuple] = {}
     for group, idx, rec in todo:
         k = prompt_key(group, idx)
         attempts_by_key[k] = []
-        accepted_by_key[k] = None
+        accepted_by_key[k] = []
         prompt_by_key[k] = (group, idx, rec)
 
+    # In multi-output mode, always run ALL rounds (don't stop at first valid).
+    # In first_valid_only mode, stop a prompt once it has ≥1 accepted.
+    first_only = args.first_valid_only
     remaining_keys = list(prompt_by_key.keys())
 
     for round_i in range(args.retries_per_prompt):
@@ -443,8 +464,6 @@ def run_batched_local(args, todo, rd, pp, prompt_key):
         print(f"[T6] batched round {round_i + 1}/{args.retries_per_prompt}: "
               f"{len(remaining_keys)} prompts in this round")
 
-        # Process in chunks of batch_size (pipeline handles internal batching,
-        # but we also bound memory per call)
         BS = args.batch_size
         for i in range(0, len(remaining_keys), BS):
             chunk_keys = remaining_keys[i:i + BS]
@@ -459,16 +478,12 @@ def run_batched_local(args, todo, rd, pp, prompt_key):
             except Exception as e:
                 print(f"[T6] WARN: batch error in round {round_i}: {e}")
                 time.sleep(1.0)
-                # retry this whole chunk in next round
                 still_pending.extend(chunk_keys)
                 continue
 
-            # Score each output in the chunk and update state
             for k, raw_trace in zip(chunk_keys, traces):
                 (group, idx, rec) = prompt_by_key[k]
                 gt = rec["ground_truth"]
-                # Strip chat-template noise / duplicate sections in-place so
-                # what's saved is already clean.
                 trace, was_cleaned = clean_trace(raw_trace, gt)
                 ans, ans_ok, sections = _score_trace(trace, gt)
                 attempts_by_key[k].append({
@@ -478,24 +493,39 @@ def run_batched_local(args, todo, rd, pp, prompt_key):
                     "sections": sections,
                 })
                 if _trace_is_accepted(ans_ok, sections):
-                    accepted_by_key[k] = attempts_by_key[k][-1]
-                    # write as soon as accepted — resume-safe
-                    _write_per_prompt(rd, k, group, idx, gt, rec["prompt"],
-                                      args.teacher, teacher_model,
-                                      attempts_by_key[k], accepted_by_key[k])
-                    pp.tick(f"{k} ✓")
+                    # De-dup: skip if trace text identical to already-accepted
+                    if not any(a["trace"] == trace for a in accepted_by_key[k]):
+                        accepted_by_key[k].append(attempts_by_key[k][-1])
+                    if first_only:
+                        # write final state immediately, stop round cycling
+                        _write_per_prompt(
+                            rd, k, group, idx, gt, rec["prompt"],
+                            args.teacher, teacher_model,
+                            attempts_by_key[k],
+                            accepted_traces=accepted_by_key[k],
+                        )
+                        pp.tick(f"{k} ✓×1")
+                    else:
+                        # collect more; will write at end of all rounds
+                        still_pending.append(k)
                 else:
                     still_pending.append(k)
 
         remaining_keys = still_pending
 
-    # Write per_prompt for everything that never got accepted
-    for k in remaining_keys:
-        (group, idx, rec) = prompt_by_key[k]
-        _write_per_prompt(rd, k, group, idx, rec["ground_truth"], rec["prompt"],
-                          args.teacher, teacher_model,
-                          attempts_by_key[k], None)
-        pp.tick(f"{k} ✗")
+    # Final write: everyone not yet persisted in first_only mode
+    for k, (group, idx, rec) in prompt_by_key.items():
+        p = rd.per_prompt / f"{k}.json"
+        if p.exists():
+            continue  # already written in first_only short-circuit
+        _write_per_prompt(
+            rd, k, group, idx, rec["ground_truth"], rec["prompt"],
+            args.teacher, teacher_model,
+            attempts_by_key[k],
+            accepted_traces=accepted_by_key[k],
+        )
+        n_acc = len(accepted_by_key[k])
+        pp.tick(f"{k} {'✓×' + str(n_acc) if n_acc else '✗'}")
 
 
 def main():
@@ -538,6 +568,14 @@ def main():
                     help="batch size for local backend (HF pipeline batched "
                          "mode). Set to 1 to disable batching (legacy serial "
                          "path). Only applies to --teacher local.")
+    ap.add_argument("--collect_all_valid", action="store_true", default=True,
+                    help="When True (default v1.6.1), emit EVERY valid teacher "
+                         "trace per prompt as a separate SFT row (not just the "
+                         "first accepted). Combined with temperature>0 + multiple "
+                         "retries, this produces diverse correct traces per prompt.")
+    ap.add_argument("--first_valid_only", action="store_true",
+                    help="Legacy pre-v1.6.1 behaviour: stop at first valid "
+                         "trace. Overrides --collect_all_valid.")
     add_common_args(ap)
     args = ap.parse_args()
 
@@ -617,50 +655,61 @@ def main():
 
     with out_path.open("w", encoding="utf-8") as f:
         for r in all_recs:
-            acc = r.get("accepted_trace")
-            if acc is None:
-                continue
-            sft_pair = {
-                "group": r["group"],
-                "idx": r["idx"],
-                "gt": r["gt"],
-                "question": r["prompt"],
-                "answer": acc["trace"],
-                "sections": acc["sections"],
-                "teacher_model": r["teacher_model"],
-                "teacher_answer": acc["teacher_answer"],
-                "teacher_answer_correct": acc["teacher_answer_correct"],
-            }
-            f.write(json.dumps(sft_pair, ensure_ascii=False) + "\n")
+            # v1.6.1: emit ONE SFT row per accepted trace (multi-output).
+            # Fall back to legacy single-trace field for old per_prompt files.
+            accepted_list = r.get("accepted_traces")
+            if accepted_list is None:
+                acc = r.get("accepted_trace")
+                accepted_list = [acc] if acc else []
+            for trace_idx, acc in enumerate(accepted_list):
+                if acc is None:
+                    continue
+                sft_pair = {
+                    "group": r["group"],
+                    "idx": r["idx"],
+                    "trace_idx": trace_idx,
+                    "gt": r["gt"],
+                    "question": r["prompt"],
+                    "answer": acc["trace"],
+                    "sections": acc["sections"],
+                    "teacher_model": r["teacher_model"],
+                    "teacher_answer": acc["teacher_answer"],
+                    "teacher_answer_correct": acc["teacher_answer_correct"],
+                }
+                f.write(json.dumps(sft_pair, ensure_ascii=False) + "\n")
 
     n_accepted = sum(1 for r in all_recs if r["accepted"])
-    # Cleaning stats: how many accepted traces were stripped of chat-template
-    # noise during generation.
-    n_cleaned = sum(
-        1 for r in all_recs
-        if r.get("accepted_trace") and r["accepted_trace"].get("was_cleaned")
-    )
+    total_traces = sum(len(r.get("accepted_traces") or []) for r in all_recs)
+    # Cleaning stats: how many written traces were stripped of chat-template
+    n_cleaned = 0
+    for r in all_recs:
+        for acc in (r.get("accepted_traces") or []):
+            if acc and acc.get("was_cleaned"):
+                n_cleaned += 1
 
     summary = {
         "n_prompts": len(all_recs),
-        "n_accepted": n_accepted,
+        "n_prompts_with_accepted": n_accepted,
         "cover_rate": n_accepted / max(len(all_recs), 1),
-        "sft_pairs_written": n_accepted,
+        "total_accepted_traces": total_traces,
+        "avg_traces_per_accepted_prompt": total_traces / max(n_accepted, 1),
+        "sft_pairs_written": total_traces,
         "n_traces_cleaned": n_cleaned,
-        "clean_rate": n_cleaned / max(n_accepted, 1),
+        "clean_rate": n_cleaned / max(total_traces, 1),
         "out_jsonl": str(out_path),
     }
     rd.write_summary(summary)
 
     print()
     print("═" * 60)
-    print(f"[T6] accepted: {n_accepted}/{len(all_recs)} "
+    print(f"[T6] prompts with ≥1 accepted: {n_accepted}/{len(all_recs)} "
           f"({n_accepted / max(len(all_recs), 1):.2%})")
-    print(f"[T6] cleaned:  {n_cleaned}/{n_accepted} "
-          f"({n_cleaned / max(n_accepted, 1):.2%} of accepted traces had "
-          f"chat-template noise stripped at save time)")
-    print(f"[T6] SFT pairs → {out_path}")
-    print(f"[T6] summary   → {rd.summary_path}")
+    print(f"[T6] total valid traces:       {total_traces}  "
+          f"(avg {total_traces/max(n_accepted,1):.2f} traces/prompt)")
+    print(f"[T6] cleaned:                  {n_cleaned}/{total_traces} "
+          f"({n_cleaned / max(total_traces, 1):.2%})")
+    print(f"[T6] SFT pairs →               {out_path}  ({total_traces} rows)")
+    print(f"[T6] summary   →               {rd.summary_path}")
 
 
 if __name__ == "__main__":

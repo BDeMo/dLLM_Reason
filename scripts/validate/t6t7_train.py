@@ -60,7 +60,10 @@ def parse_args():
                     help="output dir name (default: <jsonl_basename>_<ts>)")
     ap.add_argument("--init_ckpt", type=str, default="GSAI-ML/LLaDA-8B-Instruct",
                     help="starting model (HF id or local path)")
-    ap.add_argument("--max_seq_len", type=int, default=512)
+    ap.add_argument("--max_seq_len", type=int, default=768,
+                    help="prompt + target length cap. 768 safe for gsm8k "
+                         "prompt (100-300 tok) + cleaned teacher trace "
+                         "(~100-500 tok). Bump if seeing 'exceeds max_seq_len'.")
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum_steps", type=int, default=4,

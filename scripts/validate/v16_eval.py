@@ -212,9 +212,20 @@ def main():
     ap.add_argument("--label", type=str, default="ckpt")
     ap.add_argument("--ckpts", type=str, nargs="+", default=None,
                     help="multiple ckpts in 'label=path' form")
-    ap.add_argument("--gen_length", type=int, default=192)
-    ap.add_argument("--block_length", type=int, default=32)
-    ap.add_argument("--temperature", type=float, default=0.0)
+    # Canonical eval config — MUST match scope_fail/scope_ok creation config.
+    # Source: docs/archive/ablation_index.zh.md § Setting & Definitions:
+    #   T=0, block_length=32, gen_length=128, remasking=low_confidence
+    # scope_fail_prompts.json items all have num_steps=128, block_length=32.
+    # Using any other config breaks the fail/ok labeling contract — e.g.
+    # gen_length=192 was observed to make baseline 'solve' 39/60 fail
+    # prompts (matches A6's per-length report) purely from the longer
+    # canvas, not from model capability change.
+    ap.add_argument("--gen_length", type=int, default=128,
+                    help="MUST match scope creation config (default 128).")
+    ap.add_argument("--block_length", type=int, default=32,
+                    help="MUST match scope creation config (default 32).")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="MUST match scope creation config (default 0).")
     ap.add_argument("--out_dir", type=str, default=None,
                     help="default: runs/validation/v16_eval_<ts>")
     args = ap.parse_args()
