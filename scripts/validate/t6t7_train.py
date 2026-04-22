@@ -472,6 +472,26 @@ def main():
             if inner is None:
                 raise AttributeError("LLaDAWrapper._llada missing")
 
+            # CRITICAL for intermediate exports via step_hook: LoRA merge
+            # must be REVERSIBLE. peft.merge_and_unload() is destructive —
+            # it folds adapters into base AND removes the adapter layers,
+            # leaving all params frozen (base was frozen; adapter gone).
+            # Training then crashes on next backward:
+            #   'element 0 of tensors does not require grad and does not
+            #    have a grad_fn'
+            # Use merge_adapter() / unmerge_adapter() pair instead: the
+            # merge is in-place, but keeps the adapter structure attached
+            # so unmerge reverses it, and training continues normally.
+            def _save_lora_merged(peft_model, dst):
+                peft_model.merge_adapter()
+                try:
+                    # base_model.model is the underlying HF model with
+                    # adapters merged into its Linears
+                    peft_model.base_model.model.save_pretrained(
+                        dst, safe_serialization=True)
+                finally:
+                    peft_model.unmerge_adapter()
+
             if is_ddp and args.parallel == "fsdp":
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
                 with FSDP.summon_full_params(inner, writeback=False,
@@ -480,9 +500,8 @@ def main():
                     if is_main:
                         peft_or_hf = inner.module if hasattr(inner, "module") else inner
                         if args.use_lora and args.lora_merge_on_save:
-                            merged = peft_or_hf.merge_and_unload()
-                            merged.save_pretrained(dst_dir, safe_serialization=True)
-                            print(f"[T6T7] FSDP+LoRA merged → {dst_dir}")
+                            _save_lora_merged(peft_or_hf, dst_dir)
+                            print(f"[T6T7] FSDP+LoRA merged (reversible) → {dst_dir}")
                         elif args.use_lora:
                             peft_or_hf.save_pretrained(dst_dir)
                             print(f"[T6T7] FSDP+LoRA adapter → {dst_dir}")
@@ -494,9 +513,8 @@ def main():
             else:
                 if is_main:
                     if args.use_lora and args.lora_merge_on_save:
-                        merged = inner.merge_and_unload()
-                        merged.save_pretrained(dst_dir, safe_serialization=True)
-                        print(f"[T6T7] LoRA merged → {dst_dir}")
+                        _save_lora_merged(inner, dst_dir)
+                        print(f"[T6T7] LoRA merged (reversible) → {dst_dir}")
                     else:
                         inner.save_pretrained(dst_dir, safe_serialization=True)
 
