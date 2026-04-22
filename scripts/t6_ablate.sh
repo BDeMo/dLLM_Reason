@@ -150,9 +150,12 @@ fi
 
 [[ "$DRY_RUN" -eq 1 ]] && { echo "[ABL] dry: skip eval/aggregate"; exit 0; }
 
-# ── 2. eval each hf_step_<N> vs baseline ────────────────────────────────
+# ── 2. eval each hf_step_<N> — ONLY t6, baseline is definitionally 0/N_fail
+# and N_ok/N_ok by how scope_fail / scope_ok were constructed (prompts
+# baseline failed / succeeded under this same canonical config). Re-testing
+# baseline each time is ~10-15 min × N of pure waste.
 echo
-echo "[ABL] ===== Phase: eval each exported ckpt ====="
+echo "[ABL] ===== Phase: eval each exported ckpt (t6 only; baseline is constant) ====="
 
 IFS=',' read -r -a STEPS_ARR <<< "$TARGET_STEPS_CSV"
 for S in "${STEPS_ARR[@]}"; do
@@ -166,7 +169,7 @@ for S in "${STEPS_ARR[@]}"; do
     EVAL_LOG="$LOG_DIR/ablate_eval_step${S}_${TS_ALL}.log"
     echo "[ABL]   eval step=$S  → $EVAL_OUT  log: $EVAL_LOG"
     if ! python scripts/validate/v16_eval.py \
-            --ckpts "baseline=$BASELINE_CKPT" "t6=$HF_CKPT" \
+            --ckpts "t6=$HF_CKPT" \
             --out_dir "$EVAL_OUT" \
             --gen_length "$EVAL_GEN_LENGTH" \
             --block_length "$EVAL_BLOCK_LENGTH" \
@@ -208,8 +211,19 @@ for d in abl.glob("step_*"):
         rows.append((meta, None, None)); continue
     data = json.load(open(sj))
     ckpts = data.get("ckpts", [])
-    base = next((c for c in ckpts if c["label"] == "baseline"), None)
     t6   = next((c for c in ckpts if c["label"] == "t6"), None)
+    # Baseline is definitionally 0/n_fail and n_ok/n_ok — synthesize it
+    # from the t6 row's split sizes rather than re-testing (deterministic
+    # by construction of scope_fail/scope_ok).
+    if t6 is not None:
+        base = {
+            "label": "baseline",
+            "n_fail": t6["n_fail"], "n_ok": t6["n_ok"],
+            "fail_correct": 0, "ok_correct": t6["n_ok"],
+            "fail_pass@1": 0.0, "ok_pass@1": 1.0,
+        }
+    else:
+        base = None
     rows.append((meta, base, t6))
 rows.sort(key=lambda r: r[0].get("step", 1e9))
 
