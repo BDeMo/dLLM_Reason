@@ -52,6 +52,12 @@ class Finetuner(Trainer):
         super().__init__(model, train_loader, val_loader, cfg)
         self.ft_config = cfg
 
+        # Optional per-step hook: callable(global_step: int, trainer: Finetuner)
+        # Invoked after every optimizer step. Used e.g. to export HF ckpts at
+        # specific target steps during a single training run, avoiding the
+        # N× waste of retraining for each ablation point.
+        self.step_hook = None
+
         # Use cosine with warm restarts for fine-tuning
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, T_0=1000, T_mult=2
@@ -158,3 +164,9 @@ class Finetuner(Trainer):
             # Step ckpt: ALL ranks enter (collective state_dict inside)
             if self.global_step % cfg.save_every == 0:
                 self.save_checkpoint(save_dir / f"step_{self.global_step}.pt")
+
+            # User-supplied step hook (e.g. HF export at specific ablation
+            # target steps). ALL ranks must enter — if the hook does any
+            # FSDP collective, it can't be rank-gated here.
+            if self.step_hook is not None:
+                self.step_hook(self.global_step, self)

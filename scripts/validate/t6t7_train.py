@@ -106,6 +106,15 @@ def parse_args():
                     help="rolling: keep only the most recent N step_*.pt "
                          "(best.pt always kept). 8B+fp32 AdamW ckpt ~96GB; "
                          "default 2 caps disk at ~200GB + best.pt. 0=keep all")
+    ap.add_argument("--hf_export_at_steps", type=str, default="",
+                    help="comma-list of global_step values at which to also "
+                         "export an HF-format ckpt to save_dir/hf_step_<N>/. "
+                         "Enables a single training run to produce checkpoints "
+                         "for multiple epoch/step ablation points — the "
+                         "deterministic training trajectory means θ at step "
+                         "N is identical whether reached fresh or mid-run. "
+                         "E.g. '85,169,338,676' for epochs {0.5,1,2,4} on "
+                         "the 1350-sample split.")
     ap.add_argument("--prompt_template", type=str,
                     default="Q: {question}\nA: {answer}")
     ap.add_argument("--seed", type=int, default=42)
@@ -441,20 +450,7 @@ def main():
     else:
         maybe_print(f"[T6T7] no prior step_*.pt in {save_dir}; fresh start")
 
-    trainer.train()
-
-    # In DDP mode, wait for all ranks to finish training before HF export
-    if is_ddp:
-        import torch.distributed as dist
-        dist.barrier()
-
-    # ── Export HF-format checkpoint for serving ─────────────────────────────
-    # CRITICAL: under FSDP, `summon_full_params` and `state_dict()` are
-    # COLLECTIVE calls — all ranks must enter together. Early-returning on
-    # non-main ranks here would deadlock rank 0. So the gather context is
-    # entered on ALL ranks; only rank 0 performs the actual disk write.
-    #
-    # Resolve the LLaDAWrapper:
+    # Resolve the LLaDAWrapper (for HF export and for the step-hook closure):
     #   - fsdp path: model is still LLaDAWrapper (FSDP wrapped ._llada inner)
     #   - ddp path:  model is TransparentDDP(LLaDAWrapper), unwrap via .module
     #   - single-gpu: model is LLaDAWrapper directly
@@ -463,72 +459,89 @@ def main():
     else:
         inner_wrapper = model
 
-    hf_dir = save_dir / "hf"
-    if is_main:
-        hf_dir.mkdir(parents=True, exist_ok=True)
+    def export_hf(dst_dir):
+        """Export an HF-format checkpoint of the current model state to
+        `dst_dir`. Safe to call from all ranks — under FSDP, summon_full_params
+        is COLLECTIVE, only rank 0 writes, and we barrier at the end so
+        callers can keep training together.
+        """
+        if is_main:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            inner = getattr(inner_wrapper, "_llada", None)
+            if inner is None:
+                raise AttributeError("LLaDAWrapper._llada missing")
 
-    try:
-        inner = getattr(inner_wrapper, "_llada", None)
-        if inner is None:
-            raise AttributeError("LLaDAWrapper._llada missing")
-
-        if is_ddp and args.parallel == "fsdp":
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            # summon_full_params is COLLECTIVE — all ranks enter. With
-            # rank0_only=True, only rank 0 gets the unsharded tensors; the
-            # others just participate in the all-gather then immediately
-            # resume sharded state on context exit.
-            with FSDP.summon_full_params(inner, writeback=False,
-                                         offload_to_cpu=True,
-                                         rank0_only=True):
+            if is_ddp and args.parallel == "fsdp":
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                with FSDP.summon_full_params(inner, writeback=False,
+                                             offload_to_cpu=True,
+                                             rank0_only=True):
+                    if is_main:
+                        peft_or_hf = inner.module if hasattr(inner, "module") else inner
+                        if args.use_lora and args.lora_merge_on_save:
+                            merged = peft_or_hf.merge_and_unload()
+                            merged.save_pretrained(dst_dir, safe_serialization=True)
+                            print(f"[T6T7] FSDP+LoRA merged → {dst_dir}")
+                        elif args.use_lora:
+                            peft_or_hf.save_pretrained(dst_dir)
+                            print(f"[T6T7] FSDP+LoRA adapter → {dst_dir}")
+                        else:
+                            peft_or_hf.save_pretrained(dst_dir, safe_serialization=True)
+                            print(f"[T6T7] FSDP full-SFT → {dst_dir}")
+                import torch.distributed as dist
+                dist.barrier()
+            else:
                 if is_main:
-                    # Only rank 0 sees real params + writes
-                    peft_or_hf = inner.module if hasattr(inner, "module") else inner
                     if args.use_lora and args.lora_merge_on_save:
-                        merged = peft_or_hf.merge_and_unload()
-                        merged.save_pretrained(hf_dir, safe_serialization=True)
-                        print(f"[T6T7] FSDP+LoRA merged → {hf_dir}")
-                    elif args.use_lora:
-                        peft_or_hf.save_pretrained(hf_dir)
-                        print(f"[T6T7] FSDP+LoRA adapter → {hf_dir}")
+                        merged = inner.merge_and_unload()
+                        merged.save_pretrained(dst_dir, safe_serialization=True)
+                        print(f"[T6T7] LoRA merged → {dst_dir}")
                     else:
-                        peft_or_hf.save_pretrained(hf_dir, safe_serialization=True)
-                        print(f"[T6T7] FSDP full-SFT → {hf_dir}")
-            # Barrier so non-main ranks wait until rank 0 finishes the
-            # final disk I/O + any post-processing below.
-            import torch.distributed as dist
-            dist.barrier()
-        else:
-            # ddp / single-gpu path — no collective gather needed
-            if is_main:
-                if args.use_lora and args.lora_merge_on_save:
-                    merged = inner.merge_and_unload()
-                    merged.save_pretrained(hf_dir, safe_serialization=True)
-                    print(f"[T6T7] LoRA merged → {hf_dir}")
-                else:
-                    inner.save_pretrained(hf_dir, safe_serialization=True)
+                        inner.save_pretrained(dst_dir, safe_serialization=True)
 
-        # Tokenizer + trust_remote_code files — rank 0 only
-        if is_main:
-            if hasattr(inner_wrapper, "tokenizer"):
-                inner_wrapper.tokenizer.save_pretrained(hf_dir)
-            # Copy modeling_llada.py / configuration_llada.py etc. from the
-            # source dir (if init_ckpt is a local path). HF-hub ids won't
-            # resolve to a local dir, so this is a no-op there — user must
-            # pass --init_ckpt <local_path> or ensure HF cache is populated.
-            src_path = Path(args.init_ckpt)
-            if src_path.exists() and src_path.is_dir():
-                import shutil
-                for name in ("modeling_llada.py", "configuration_llada.py",
-                             "tokenization_llada.py"):
-                    src = src_path / name
-                    if src.is_file():
-                        shutil.copy2(src, hf_dir / name)
-            print(f"[T6T7] HF-format ckpt → {hf_dir}")
-    except Exception as e:
-        if is_main:
-            print(f"[T6T7] WARN: HF export failed: {e}")
-            print(f"[T6T7] .pt checkpoints still usable via load_checkpoint()")
+            # Tokenizer + trust_remote_code files — rank 0 only
+            if is_main:
+                if hasattr(inner_wrapper, "tokenizer"):
+                    inner_wrapper.tokenizer.save_pretrained(dst_dir)
+                src_path = Path(args.init_ckpt)
+                if src_path.exists() and src_path.is_dir():
+                    import shutil
+                    for name in ("modeling_llada.py", "configuration_llada.py",
+                                 "tokenization_llada.py"):
+                        src = src_path / name
+                        if src.is_file():
+                            shutil.copy2(src, dst_dir / name)
+                print(f"[T6T7] HF ckpt → {dst_dir}")
+        except Exception as e:
+            if is_main:
+                print(f"[T6T7] WARN: HF export failed at {dst_dir}: {e}")
+                print(f"[T6T7] .pt checkpoints still usable via load_checkpoint()")
+
+    # Parse --hf_export_at_steps and wire into the Finetuner step_hook so
+    # a SINGLE training run emits HF ckpts at every ablation target step.
+    # Exploits the determinism of training: θ at step N is identical whether
+    # reached fresh or mid-run, so ablating over duration needs exactly one
+    # training to max(target_steps).
+    export_steps = set()
+    if args.hf_export_at_steps.strip():
+        export_steps = {int(s) for s in args.hf_export_at_steps.split(",") if s.strip()}
+        maybe_print(f"[T6T7] will export HF ckpts at steps: "
+                    f"{sorted(export_steps)}")
+        def _hook(step, _tr):
+            if step in export_steps:
+                export_hf(save_dir / f"hf_step_{step}")
+        trainer.step_hook = _hook
+
+    trainer.train()
+
+    # In DDP mode, wait for all ranks to finish training before final export
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+
+    # ── Final HF export (end-of-training, whole model) ──────────────────────
+    export_hf(save_dir / "hf")
 
     if is_main:
         print(f"[T6T7] done. checkpoints → {save_dir}")
