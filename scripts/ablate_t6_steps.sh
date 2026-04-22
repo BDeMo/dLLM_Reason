@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
-# sweep_t6_steps.sh — sweep T6_MAX_STEPS to find fail/ok Pareto sweet spot.
+# ablate_t6_steps.sh — ablation over T6 SFT max_steps to find the
+# fail-rescue vs ok-retention Pareto sweet spot.
 #
-# Context: v1.6.1 T6 SFT at max_steps=2000 → 190 epochs on a 1350-sample
-# split → catastrophic forgetting (fail +26.6% but ok -27%). Need to find
-# steps where fail rescue stays while ok retention is ≥ 95%.
+# Context: v1.6.1 T6 SFT at default max_steps=2000 on a 1350-sample
+# train split (effective batch = 1 × 16 × 8 = 128; backward every 8
+# samples → ~12 epochs) overfits: fail +26.6% but ok -27%, net -179.
+#
+# Physical meaning of `steps` (global_step in Finetuner):
+#   - 1 step   = 1 forward + 1 backward (grad_accum'd)
+#   - samples  = steps × batch_size × world_size   (= steps × 8)
+#   - epoch    = steps × 8 / 1350  (~169 steps per epoch under current cfg)
+#
+# Default ablation range covers ~0.6 / 1.2 / 2.4 / 4.7 epochs.
 #
 # For each step count S in STEPS_LIST:
 #   1. wipe runs/training/v161_t6
 #   2. run Phase 4 (SFT with --t6_max_steps S) + Phase 5 (eval)
-#   3. rename eval dir → runs/validation/sweep_t6_steps/steps_S
+#   3. rename eval dir → runs/validation/ablate_t6_steps/steps_S
 #   4. collect summary.json from each run
-# Final: write runs/validation/sweep_t6_steps/summary.md with one row per S.
+# Final: write runs/validation/ablate_t6_steps/summary.md with one row per S.
 #
 # Usage:
-#   bash scripts/sweep_t6_steps.sh                       # default 40,80,120,200
-#   bash scripts/sweep_t6_steps.sh 30 60 100 150 250
-#   bash scripts/sweep_t6_steps.sh --lora 40 80 160      # sweep under LoRA
-#   bash scripts/sweep_t6_steps.sh --dry_run 40
+#   bash scripts/ablate_t6_steps.sh                      # default 100 200 400 800
+#   bash scripts/ablate_t6_steps.sh 50 100 200 400 700
+#   bash scripts/ablate_t6_steps.sh --lora 100 300 600   # ablation under LoRA
+#   bash scripts/ablate_t6_steps.sh --dry_run 100
 
 set -euo pipefail
 
@@ -32,31 +40,31 @@ while [[ $# -gt 0 ]]; do
         *) STEPS+=("$1"); shift ;;
     esac
 done
-[[ "${#STEPS[@]}" -eq 0 ]] && STEPS=(40 80 120 200)
+[[ "${#STEPS[@]}" -eq 0 ]] && STEPS=(100 200 400 800)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
-SWEEP_DIR="$ROOT/runs/validation/sweep_t6_steps"
-mkdir -p "$SWEEP_DIR"
-LOG_DIR="$ROOT/runs/sweep_logs"
+ABL_DIR="$ROOT/runs/validation/ablate_t6_steps"
+mkdir -p "$ABL_DIR"
+LOG_DIR="$ROOT/runs/ablate_logs"
 mkdir -p "$LOG_DIR"
 
 TS_ALL=$(date +%Y%m%d_%H%M%S)
-MANIFEST="$SWEEP_DIR/manifest_${TS_ALL}.txt"
+MANIFEST="$ABL_DIR/manifest_${TS_ALL}.txt"
 {
-    echo "sweep started: $TS_ALL"
+    echo "ablation started: $TS_ALL"
     echo "STEPS = ${STEPS[*]}"
     echo "USE_LORA = $USE_LORA"
     echo "DRY_RUN = $DRY_RUN"
 } > "$MANIFEST"
 
-echo "[SWEEP] ============================================================"
-echo "[SWEEP]   T6_MAX_STEPS sweep:  ${STEPS[*]}"
-echo "[SWEEP]   USE_LORA=$USE_LORA  DRY_RUN=$DRY_RUN"
-echo "[SWEEP]   output dir: $SWEEP_DIR"
-echo "[SWEEP] ============================================================"
+echo "[ABL] ============================================================"
+echo "[ABL]   T6_MAX_STEPS ablation:  ${STEPS[*]}"
+echo "[ABL]   USE_LORA=$USE_LORA  DRY_RUN=$DRY_RUN"
+echo "[ABL]   output dir: $ABL_DIR"
+echo "[ABL] ============================================================"
 
 T6_CKPT_DIR="$ROOT/runs/training/v161_t6"
 
@@ -66,60 +74,60 @@ EXTRA_FLAGS=()
 
 for S in "${STEPS[@]}"; do
     echo
-    echo "[SWEEP] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  steps=$S  <<<<<<<<<<<<<<<<<<<<<<<<<<"
-    LOG="$LOG_DIR/sweep_steps_${S}_${TS_ALL}.log"
+    echo "[ABL] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  steps=$S  <<<<<<<<<<<<<<<<<<<<<<<<<<"
+    LOG="$LOG_DIR/ablate_steps_${S}_${TS_ALL}.log"
 
     # 1. wipe prior T6 ckpt so Phase 4 re-runs (skip-if-present guard bypass)
     if [[ -d "$T6_CKPT_DIR" && "$DRY_RUN" -eq 0 ]]; then
-        echo "[SWEEP] wiping $T6_CKPT_DIR"
+        echo "[ABL] wiping $T6_CKPT_DIR"
         rm -rf "$T6_CKPT_DIR"
     fi
 
     # 2. run Phase 4 + Phase 5
     dry_flag=()
     [[ "$DRY_RUN" -eq 1 ]] && dry_flag=(--dry_run)
-    echo "[SWEEP] launching Phase 4+5 for steps=$S  (log: $LOG)"
+    echo "[ABL] launching Phase 4+5 for steps=$S  (log: $LOG)"
     if ! bash scripts/run_all_v1.6.1.sh \
             --from_phase 4 --to_phase 5 \
             --t6_max_steps "$S" \
             "${EXTRA_FLAGS[@]}" \
             "${dry_flag[@]}" \
             > "$LOG" 2>&1; then
-        echo "[SWEEP] ✗ steps=$S FAILED — see $LOG"
+        echo "[ABL] ✗ steps=$S FAILED — see $LOG"
         echo "steps=$S FAILED" >> "$MANIFEST"
         continue
     fi
 
     # 3. locate + rename the eval dir we just produced
-    [[ "$DRY_RUN" -eq 1 ]] && { echo "[SWEEP] dry: skip rename/collect"; continue; }
+    [[ "$DRY_RUN" -eq 1 ]] && { echo "[ABL] dry: skip rename/collect"; continue; }
 
     latest_eval=$(ls -dt "$ROOT"/runs/validation/v161_eval_* 2>/dev/null | head -1)
     if [[ -z "$latest_eval" || ! -d "$latest_eval" ]]; then
-        echo "[SWEEP] ✗ steps=$S: no v161_eval_* dir produced"
+        echo "[ABL] ✗ steps=$S: no v161_eval_* dir produced"
         echo "steps=$S NO_EVAL_DIR" >> "$MANIFEST"
         continue
     fi
-    DEST="$SWEEP_DIR/steps_${S}"
+    DEST="$ABL_DIR/steps_${S}"
     rm -rf "$DEST"
     mv "$latest_eval" "$DEST"
-    echo "[SWEEP]   steps=$S → $DEST"
+    echo "[ABL]   steps=$S → $DEST"
     echo "steps=$S ok → $DEST" >> "$MANIFEST"
 done
 
 # 4. aggregate summary into one markdown table
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[SWEEP] dry-run done"; exit 0
+    echo "[ABL] dry-run done"; exit 0
 fi
 
 echo
-echo "[SWEEP] aggregating summary..."
+echo "[ABL] aggregating summary..."
 python - <<PY
 import json
 from pathlib import Path
 
-sweep = Path("$SWEEP_DIR")
+abl = Path("$ABL_DIR")
 rows = []
-for d in sorted(sweep.glob("steps_*"),
+for d in sorted(abl.glob("steps_*"),
                 key=lambda p: int(p.name.split("_")[1])):
     sj = d / "summary.json"
     if not sj.exists():
@@ -132,18 +140,20 @@ for d in sorted(sweep.glob("steps_*"),
     rows.append((d.name, base, t6))
 
 lines = [
-    "# T6 SFT max_steps sweep",
+    "# T6 SFT max_steps ablation",
     "",
     "Finding the Pareto sweet spot for fail rescue vs ok retention.",
+    "Physical: 1 step ≈ 8 samples ≈ 1/169 epoch (train split = 1350).",
     "",
-    "| steps | fail rescued | ok retention | Δ fail | Δ ok | net | FAIL18 | ceiling-5 |",
-    "|---|---|---|---|---|---|---|---|",
+    "| steps | epochs | fail rescued | ok retention | Δ fail | Δ ok | net | FAIL18 | ceiling-5 |",
+    "|---|---|---|---|---|---|---|---|---|",
 ]
 for name, base, t6 in rows:
     if base is None or t6 is None:
-        lines.append(f"| {name} | — | — | — | — | — | — | — |")
+        lines.append(f"| {name} | — | — | — | — | — | — | — | — |")
         continue
-    s = name.split("_")[1]
+    s = int(name.split("_")[1])
+    ep = s * 8 / 1350
     fail_r = t6["fail_correct"]
     ok_r   = t6["ok_correct"]
     fail_b = base["fail_correct"]
@@ -153,6 +163,7 @@ for name, base, t6 in rows:
     net    = d_fail + d_ok
     lines.append(
         f"| {s} "
+        f"| {ep:.2f} "
         f"| {fail_r}/{t6['n_fail']} ({t6['fail_pass@1']:.1%}) "
         f"| {ok_r}/{t6['n_ok']} ({t6['ok_pass@1']:.1%}) "
         f"| +{d_fail} "
@@ -166,12 +177,12 @@ lines += [
     "**Target**: max net positive, ideally fail rescue ≥ 15% with ok retention ≥ 95%.",
     "",
 ]
-out_md = sweep / f"summary_${TS_ALL}.md"
+out_md = abl / f"summary_${TS_ALL}.md"
 out_md.write_text("\n".join(lines), encoding="utf-8")
-# also overwrite sweep/summary.md for latest
-(sweep / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+# also overwrite latest
+(abl / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 print(open(out_md).read())
-print(f"\n[SWEEP] summary → {out_md}")
+print(f"\n[ABL] summary → {out_md}")
 PY
 
-echo "[SWEEP] done. All artefacts under $SWEEP_DIR"
+echo "[ABL] done. All artefacts under $ABL_DIR"
