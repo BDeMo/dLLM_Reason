@@ -155,10 +155,68 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[LORA-ABL] dry-run done"; exit 0
 fi
 
+# ── Phase A.5: merge each adapter → HF ckpt (one-time, for v16_eval) ─────
+# Intermediate hf_step_<N>/ contains only the LoRA adapter (tiny,
+# non-destructive to training). v16_eval doesn't speak peft, so we merge
+# once here into hf_step_<N>_merged/ and point eval there.
+echo
+echo "[LORA-ABL] ===== MERGE  adapter → HF ckpt (one-time) ====="
+IFS=',' read -r -a STEPS_ARR <<< "$TARGET_STEPS_CSV"
+
+for R in "${RANKS[@]}"; do
+    TRAIN_DIR="$ROOT/runs/training/v161_t6_lora_r${R}"
+    for S in "${STEPS_ARR[@]}"; do
+        ADAPTER_DIR="$TRAIN_DIR/hf_step_${S}"
+        MERGED_DIR="$TRAIN_DIR/hf_step_${S}_merged"
+        if [[ ! -f "$ADAPTER_DIR/adapter_config.json" ]]; then
+            echo "[LORA-ABL] ✗ no adapter at $ADAPTER_DIR (step $S not exported?)"
+            continue
+        fi
+        if [[ -f "$MERGED_DIR/config.json" ]]; then
+            echo "[LORA-ABL]   already merged: $MERGED_DIR  (skip)"
+            continue
+        fi
+        echo "[LORA-ABL]   merge r=$R step=$S  →  $MERGED_DIR"
+        CUDA_VISIBLE_DEVICES=0 python - <<PY
+import sys, shutil
+from pathlib import Path
+from transformers import AutoModel, AutoTokenizer
+from peft import PeftModel
+import torch
+
+adapter = Path("$ADAPTER_DIR")
+merged  = Path("$MERGED_DIR")
+base_id = "$BASELINE_CKPT"
+merged.mkdir(parents=True, exist_ok=True)
+
+# load base (bf16) + attach adapter + merge_and_unload (safe now, no training)
+base = AutoModel.from_pretrained(
+    base_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+    device_map={"": 0},
+)
+m = PeftModel.from_pretrained(base, adapter)
+m = m.merge_and_unload()
+m.save_pretrained(merged, safe_serialization=True)
+tok = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+tok.save_pretrained(merged)
+
+# copy trust_remote_code files from base local dir if present
+from pathlib import Path as _P
+base_local = _P("checkpoints/llada-instruct")
+if base_local.is_dir():
+    for nm in ("modeling_llada.py", "configuration_llada.py", "tokenization_llada.py"):
+        src = base_local / nm
+        if src.is_file():
+            shutil.copy2(src, merged / nm)
+print(f"merged → {merged}")
+PY
+    done
+done
+wait
+
 # ── Phase B: eval each (rank × step) cell in parallel on $EVAL_GPUS ──────
 echo
 echo "[LORA-ABL] ===== EVAL  (parallel on $EVAL_GPUS GPUs) ====="
-IFS=',' read -r -a STEPS_ARR <<< "$TARGET_STEPS_CSV"
 
 declare -a PIDS=()
 declare -a PID_LABELS=()
@@ -166,10 +224,10 @@ g=0
 for R in "${RANKS[@]}"; do
     TRAIN_DIR="$ROOT/runs/training/v161_t6_lora_r${R}"
     for S in "${STEPS_ARR[@]}"; do
-        HF_CKPT="$TRAIN_DIR/hf_step_${S}"
+        HF_CKPT="$TRAIN_DIR/hf_step_${S}_merged"
         [[ ! -f "$HF_CKPT/config.json" ]] && {
-            echo "[LORA-ABL] ✗ missing $HF_CKPT"
-            echo "r=$R step=$S MISSING_HF" >> "$MANIFEST"
+            echo "[LORA-ABL] ✗ missing $HF_CKPT (merge failed?)"
+            echo "r=$R step=$S MISSING_MERGED" >> "$MANIFEST"
             continue
         }
         EVAL_OUT="$ABL_DIR/r${R}_step${S}"

@@ -472,25 +472,22 @@ def main():
             if inner is None:
                 raise AttributeError("LLaDAWrapper._llada missing")
 
-            # CRITICAL for intermediate exports via step_hook: LoRA merge
-            # must be REVERSIBLE. peft.merge_and_unload() is destructive —
-            # it folds adapters into base AND removes the adapter layers,
-            # leaving all params frozen (base was frozen; adapter gone).
-            # Training then crashes on next backward:
-            #   'element 0 of tensors does not require grad and does not
-            #    have a grad_fn'
-            # Use merge_adapter() / unmerge_adapter() pair instead: the
-            # merge is in-place, but keeps the adapter structure attached
-            # so unmerge reverses it, and training continues normally.
-            def _save_lora_merged(peft_model, dst):
-                peft_model.merge_adapter()
-                try:
-                    # base_model.model is the underlying HF model with
-                    # adapters merged into its Linears
-                    peft_model.base_model.model.save_pretrained(
-                        dst, safe_serialization=True)
-                finally:
-                    peft_model.unmerge_adapter()
+            # LoRA export policy:
+            # - intermediate (step_hook): save ADAPTER ONLY. Tiny (~30MB
+            #   vs ~16GB merged), fast, non-destructive to training.
+            #   20 ckpts × adapter ≈ 600MB vs 20 × merged ≈ 320GB.
+            #   The earlier 'merge_and_unload' design (a) wrote 16GB per
+            #   checkpoint to disk AND (b) destructively removed adapters
+            #   mid-training, crashing the next backward. Adapter-only
+            #   sidesteps both.
+            # - final: still merge_and_unload (training done, destructive
+            #   is fine) so downstream v16_eval/serve.py load a plain
+            #   HF ckpt without needing peft.
+            # - eval-time: ablation script must convert each adapter dir
+            #   to a merged HF ckpt before invoking v16_eval.
+            # Detect 'final' by sentinel: we pass is_final_export=True
+            # only from the end-of-training call site.
+            is_final_export = (dst_dir.name == "hf")
 
             if is_ddp and args.parallel == "fsdp":
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -499,10 +496,12 @@ def main():
                                              rank0_only=True):
                     if is_main:
                         peft_or_hf = inner.module if hasattr(inner, "module") else inner
-                        if args.use_lora and args.lora_merge_on_save:
-                            _save_lora_merged(peft_or_hf, dst_dir)
-                            print(f"[T6T7] FSDP+LoRA merged (reversible) → {dst_dir}")
+                        if args.use_lora and is_final_export and args.lora_merge_on_save:
+                            merged = peft_or_hf.merge_and_unload()
+                            merged.save_pretrained(dst_dir, safe_serialization=True)
+                            print(f"[T6T7] FSDP+LoRA merged (final) → {dst_dir}")
                         elif args.use_lora:
+                            # adapter-only: tiny + non-destructive
                             peft_or_hf.save_pretrained(dst_dir)
                             print(f"[T6T7] FSDP+LoRA adapter → {dst_dir}")
                         else:
@@ -512,9 +511,14 @@ def main():
                 dist.barrier()
             else:
                 if is_main:
-                    if args.use_lora and args.lora_merge_on_save:
-                        _save_lora_merged(inner, dst_dir)
-                        print(f"[T6T7] LoRA merged (reversible) → {dst_dir}")
+                    if args.use_lora and is_final_export and args.lora_merge_on_save:
+                        merged = inner.merge_and_unload()
+                        merged.save_pretrained(dst_dir, safe_serialization=True)
+                        print(f"[T6T7] LoRA merged (final) → {dst_dir}")
+                    elif args.use_lora:
+                        # adapter-only: training state preserved
+                        inner.save_pretrained(dst_dir)
+                        print(f"[T6T7] LoRA adapter → {dst_dir}")
                     else:
                         inner.save_pretrained(dst_dir, safe_serialization=True)
 
