@@ -33,6 +33,7 @@ STEPS_=128                      # MDLM steps (= gen_length by canonical)
 TEMPS=(0.3 0.7 1.0)
 N_FAIL=30
 N_OK=30
+EVAL_GPUS=8                     # parallel ckpts across this many GPUs
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --temps)        shift; TEMPS=(); while [[ $# -gt 0 && "$1" != --* ]]; do TEMPS+=("$1"); shift; done ;;
         --n_fail)       N_FAIL="$2"; shift 2 ;;
         --n_ok)         N_OK="$2"; shift 2 ;;
+        --eval_gpus)    EVAL_GPUS="$2"; shift 2 ;;
         --dry_run)      DRY_RUN=1; shift ;;
         -h|--help)      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[PASSN] unknown arg: $1" >&2; exit 1 ;;
@@ -111,6 +113,12 @@ echo "[PASSN]   n_fail / n_ok = $N_FAIL / $N_OK"
 echo "[PASSN]   gen/block/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
 echo "[PASSN] ============================================================"
 
+echo "[PASSN]   EVAL_GPUS      = $EVAL_GPUS (ckpts run in parallel)"
+echo
+
+declare -a PIDS=()
+declare -a PID_LABELS=()
+g=0
 for CK in "${CKPT_LIST[@]}"; do
     [[ ! -f "$CK/config.json" ]] && { echo "[PASSN] skip (no config.json): $CK"; continue; }
     LABEL=$(basename "$CK")
@@ -118,12 +126,10 @@ for CK in "${CKPT_LIST[@]}"; do
     RUN_DIR="$OUT_BASE/${PARENT}_${LABEL}_${TS}"
     LOG="$OUT_BASE/${PARENT}_${LABEL}_${TS}.log"
 
-    echo
-    echo "[PASSN] >>>>>>>>>>>>>>>>>>>>>>>>>  ckpt=$CK  <<<<<<<<<<<<<<<<<<<<<<<<<<<<"
-    echo "[PASSN]   run_dir = $RUN_DIR"
+    echo "[PASSN] launching on GPU $g: ckpt=$CK → $RUN_DIR"
     [[ "$DRY_RUN" -eq 1 ]] && { echo "[PASSN]   (dry-run, skip)"; continue; }
 
-    PYTHONUNBUFFERED=1 python -u \
+    CUDA_VISIBLE_DEVICES=$g PYTHONUNBUFFERED=1 python -u \
         scripts/validate/h3_passN_at_temperature.py \
         --model "$CK" \
         --run_dir "$RUN_DIR" \
@@ -134,7 +140,18 @@ for CK in "${CKPT_LIST[@]}"; do
         --temps "${TEMPS[@]}" \
         --n_fail "$N_FAIL" \
         --n_ok "$N_OK" \
-        2>&1 | tee "$LOG"
+        > "$LOG" 2>&1 &
+    PIDS+=($!)
+    PID_LABELS+=("${PARENT}/${LABEL}")
+    g=$(( (g + 1) % EVAL_GPUS ))
+    if [[ "${#PIDS[@]}" -ge "$EVAL_GPUS" ]]; then
+        wait "${PIDS[0]}" || echo "[PASSN] ✗ ${PID_LABELS[0]} FAILED"
+        PIDS=("${PIDS[@]:1}")
+        PID_LABELS=("${PID_LABELS[@]:1}")
+    fi
+done
+for i in "${!PIDS[@]}"; do
+    wait "${PIDS[$i]}" || echo "[PASSN] ✗ ${PID_LABELS[$i]} FAILED"
 done
 
 # ── aggregate summary ─────────────────────────────────────────────────────

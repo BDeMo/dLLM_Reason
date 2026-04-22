@@ -45,13 +45,15 @@ T6_GRAD_ACCUM=16
 EVAL_GEN_LENGTH=128
 EVAL_BLOCK_LENGTH=32
 EVAL_TEMPERATURE=0
+EVAL_GPUS=8                     # parallel eval across this many GPUs
 BASELINE_CKPT="GSAI-ML/LLaDA-8B-Instruct"
 
 EPOCHS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry_run)  DRY_RUN=1; shift ;;
-        -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --eval_gpus) EVAL_GPUS="$2"; shift 2 ;;
+        --dry_run)   DRY_RUN=1; shift ;;
+        -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) EPOCHS+=("$1"); shift ;;
     esac
 done
@@ -155,9 +157,12 @@ fi
 # baseline failed / succeeded under this same canonical config). Re-testing
 # baseline each time is ~10-15 min × N of pure waste.
 echo
-echo "[ABL] ===== Phase: eval each exported ckpt (t6 only; baseline is constant) ====="
+echo "[ABL] ===== Phase: eval each exported ckpt (parallel on $EVAL_GPUS GPUs) ====="
 
 IFS=',' read -r -a STEPS_ARR <<< "$TARGET_STEPS_CSV"
+declare -a PIDS=()
+declare -a PID_LABELS=()
+g=0
 for S in "${STEPS_ARR[@]}"; do
     HF_CKPT="$TRAIN_DIR/hf_step_${S}"
     if [[ ! -f "$HF_CKPT/config.json" ]]; then
@@ -167,19 +172,34 @@ for S in "${STEPS_ARR[@]}"; do
     fi
     EVAL_OUT="$ABL_DIR/step_${S}"
     EVAL_LOG="$LOG_DIR/ablate_eval_step${S}_${TS_ALL}.log"
-    echo "[ABL]   eval step=$S  → $EVAL_OUT  log: $EVAL_LOG"
-    if ! python scripts/validate/v16_eval.py \
-            --ckpts "t6=$HF_CKPT" \
-            --out_dir "$EVAL_OUT" \
-            --gen_length "$EVAL_GEN_LENGTH" \
-            --block_length "$EVAL_BLOCK_LENGTH" \
-            --temperature "$EVAL_TEMPERATURE" \
-            > "$EVAL_LOG" 2>&1; then
-        echo "[ABL] ✗ step=$S eval FAILED — see $EVAL_LOG"
-        echo "step=$S EVAL_FAILED" >> "$MANIFEST"
-        continue
+    echo "[ABL]   launching eval step=$S on GPU $g  → $EVAL_OUT"
+    CUDA_VISIBLE_DEVICES=$g python scripts/validate/v16_eval.py \
+        --ckpts "t6=$HF_CKPT" \
+        --out_dir "$EVAL_OUT" \
+        --gen_length "$EVAL_GEN_LENGTH" \
+        --block_length "$EVAL_BLOCK_LENGTH" \
+        --temperature "$EVAL_TEMPERATURE" \
+        > "$EVAL_LOG" 2>&1 &
+    PIDS+=($!)
+    PID_LABELS+=("step=$S")
+    g=$(( (g + 1) % EVAL_GPUS ))
+    # throttle when all GPU slots busy
+    if [[ "${#PIDS[@]}" -ge "$EVAL_GPUS" ]]; then
+        wait "${PIDS[0]}" || echo "[ABL] ✗ ${PID_LABELS[0]} FAILED"
+        PIDS=("${PIDS[@]:1}")
+        PID_LABELS=("${PID_LABELS[@]:1}")
     fi
-    # stash the epoch metadata
+done
+# drain remaining
+for i in "${!PIDS[@]}"; do
+    wait "${PIDS[$i]}" || echo "[ABL] ✗ ${PID_LABELS[$i]} FAILED"
+done
+
+# stash metadata on completed runs
+for S in "${STEPS_ARR[@]}"; do
+    EVAL_OUT="$ABL_DIR/step_${S}"
+    [[ ! -f "$EVAL_OUT/summary.json" ]] && {
+        echo "step=$S EVAL_NO_OUTPUT" >> "$MANIFEST"; continue; }
     python - <<PY
 import json
 from pathlib import Path

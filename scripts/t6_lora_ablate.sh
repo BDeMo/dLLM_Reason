@@ -37,6 +37,7 @@ T6_GRAD_ACCUM=16
 EVAL_GEN_LENGTH=128
 EVAL_BLOCK_LENGTH=32
 EVAL_TEMPERATURE=0
+EVAL_GPUS=8                     # parallel eval across this many GPUs
 BASELINE_CKPT="GSAI-ML/LLaDA-8B-Instruct"
 
 RANKS_CSV="1,2,4,8,16"
@@ -44,10 +45,11 @@ EPOCHS_CSV="0.5,1,2,4"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ranks)    RANKS_CSV="$2"; shift 2 ;;
-        --epochs)   EPOCHS_CSV="$2"; shift 2 ;;
-        --dry_run)  DRY_RUN=1; shift ;;
-        -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --ranks)     RANKS_CSV="$2"; shift 2 ;;
+        --epochs)    EPOCHS_CSV="$2"; shift 2 ;;
+        --eval_gpus) EVAL_GPUS="$2"; shift 2 ;;
+        --dry_run)   DRY_RUN=1; shift ;;
+        -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[LORA-ABL] unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -153,11 +155,14 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[LORA-ABL] dry-run done"; exit 0
 fi
 
-# ── Phase B: eval each (rank × step) cell ────────────────────────────────
+# ── Phase B: eval each (rank × step) cell in parallel on $EVAL_GPUS ──────
 echo
-echo "[LORA-ABL] ===== EVAL  each cell (t6 only; baseline is constant) ====="
+echo "[LORA-ABL] ===== EVAL  (parallel on $EVAL_GPUS GPUs) ====="
 IFS=',' read -r -a STEPS_ARR <<< "$TARGET_STEPS_CSV"
 
+declare -a PIDS=()
+declare -a PID_LABELS=()
+g=0
 for R in "${RANKS[@]}"; do
     TRAIN_DIR="$ROOT/runs/training/v161_t6_lora_r${R}"
     for S in "${STEPS_ARR[@]}"; do
@@ -169,19 +174,35 @@ for R in "${RANKS[@]}"; do
         }
         EVAL_OUT="$ABL_DIR/r${R}_step${S}"
         EVAL_LOG="$LOG_DIR/lora_r${R}_eval_step${S}_${TS_ALL}.log"
-        echo "[LORA-ABL]   eval r=$R step=$S → $EVAL_OUT"
+        echo "[LORA-ABL]   launching r=$R step=$S on GPU $g → $EVAL_OUT"
 
-        if ! python scripts/validate/v16_eval.py \
-                --ckpts "t6=$HF_CKPT" \
-                --out_dir "$EVAL_OUT" \
-                --gen_length "$EVAL_GEN_LENGTH" \
-                --block_length "$EVAL_BLOCK_LENGTH" \
-                --temperature "$EVAL_TEMPERATURE" \
-                > "$EVAL_LOG" 2>&1; then
-            echo "[LORA-ABL] ✗ r=$R step=$S eval FAILED"
-            echo "r=$R step=$S EVAL_FAILED" >> "$MANIFEST"
-            continue
+        CUDA_VISIBLE_DEVICES=$g python scripts/validate/v16_eval.py \
+            --ckpts "t6=$HF_CKPT" \
+            --out_dir "$EVAL_OUT" \
+            --gen_length "$EVAL_GEN_LENGTH" \
+            --block_length "$EVAL_BLOCK_LENGTH" \
+            --temperature "$EVAL_TEMPERATURE" \
+            > "$EVAL_LOG" 2>&1 &
+        PIDS+=($!)
+        PID_LABELS+=("r=$R step=$S")
+        g=$(( (g + 1) % EVAL_GPUS ))
+        if [[ "${#PIDS[@]}" -ge "$EVAL_GPUS" ]]; then
+            wait "${PIDS[0]}" || echo "[LORA-ABL] ✗ ${PID_LABELS[0]} FAILED"
+            PIDS=("${PIDS[@]:1}")
+            PID_LABELS=("${PID_LABELS[@]:1}")
         fi
+    done
+done
+for i in "${!PIDS[@]}"; do
+    wait "${PIDS[$i]}" || echo "[LORA-ABL] ✗ ${PID_LABELS[$i]} FAILED"
+done
+
+# stash metadata on completed cells
+for R in "${RANKS[@]}"; do
+    for S in "${STEPS_ARR[@]}"; do
+        EVAL_OUT="$ABL_DIR/r${R}_step${S}"
+        [[ ! -f "$EVAL_OUT/summary.json" ]] && {
+            echo "r=$R step=$S EVAL_NO_OUTPUT" >> "$MANIFEST"; continue; }
         python - <<PY
 import json
 from pathlib import Path
