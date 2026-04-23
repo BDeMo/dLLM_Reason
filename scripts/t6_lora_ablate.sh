@@ -186,23 +186,29 @@ import torch
 
 adapter = Path("$ADAPTER_DIR")
 merged  = Path("$MERGED_DIR")
-base_id = "$BASELINE_CKPT"
+base_id_or_path = "$BASELINE_CKPT"
 merged.mkdir(parents=True, exist_ok=True)
 
-# load base (bf16) + attach adapter + merge_and_unload (safe now, no training)
+# Resolve base to local path FIRST (offline-safe). Project convention:
+# checkpoints/llada-instruct/ is materialised by scripts/download_models.py
+# in Phase 0. Falling through to HF id requires network/cache.
+base_local = Path("checkpoints/llada-instruct")
+if base_local.is_dir() and (base_local / "config.json").exists():
+    base_path = str(base_local)
+else:
+    base_path = base_id_or_path  # HF id fallback (requires cache or net)
+
 base = AutoModel.from_pretrained(
-    base_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+    base_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
     device_map={"": 0},
 )
 m = PeftModel.from_pretrained(base, adapter)
 m = m.merge_and_unload()
 m.save_pretrained(merged, safe_serialization=True)
-tok = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+tok = AutoTokenizer.from_pretrained(base_path, trust_remote_code=True)
 tok.save_pretrained(merged)
 
-# copy trust_remote_code files from base local dir if present
-from pathlib import Path as _P
-base_local = _P("checkpoints/llada-instruct")
+# copy trust_remote_code files from base local dir
 if base_local.is_dir():
     for nm in ("modeling_llada.py", "configuration_llada.py", "tokenization_llada.py"):
         src = base_local / nm
@@ -266,9 +272,10 @@ import json
 from pathlib import Path
 spe = int("$STEPS_PER_EPOCH")
 p = Path("$EVAL_OUT/ablate_meta.json")
+# _ts stamp lets the aggregator filter out cells from prior runs
 p.write_text(json.dumps(
-    {"rank": int("$R"), "step": int("$S"), "epoch": int("$S")/spe},
-    indent=2))
+    {"rank": int("$R"), "step": int("$S"), "epoch": int("$S")/spe,
+     "_ts": "$TS_ALL"}, indent=2))
 PY
         echo "r=$R step=$S ok → $EVAL_OUT" >> "$MANIFEST"
     done
@@ -285,10 +292,13 @@ abl = Path("$ABL_DIR")
 spe = int("$STEPS_PER_EPOCH")
 
 rows = []
+this_ts = "$TS_ALL"
 for d in abl.glob("r*_step*"):
     meta_p = d / "ablate_meta.json"
     if not meta_p.exists(): continue
     meta = json.load(open(meta_p))
+    # filter to THIS run's cells only
+    if meta.get("_ts") != this_ts: continue
     sj = d / "summary.json"
     if not sj.exists():
         rows.append((meta, None)); continue

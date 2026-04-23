@@ -30,7 +30,7 @@
 # Usage:
 #   bash scripts/t6_ablate.sh                   # default 0.5 1 2 4
 #   bash scripts/t6_ablate.sh 0.25 0.5 1 2 4 8
-#   bash scripts/t6_ablate.sh --dry_run 1
+#   bash scripts/t6_ablate.sh --dry_run         # plan only, no train/eval
 
 set -euo pipefail
 
@@ -206,7 +206,9 @@ from pathlib import Path
 p = Path("$EVAL_OUT/ablate_meta.json")
 spe = int("$STEPS_PER_EPOCH")
 s = int("$S")
-p.write_text(json.dumps({"step": s, "epoch": s / spe}, indent=2))
+# stamp this run's TS so the aggregator can filter out stale cells
+# left over from prior ablations with different epoch sets
+p.write_text(json.dumps({"step": s, "epoch": s / spe, "_ts": "$TS_ALL"}, indent=2))
 PY
     echo "step=$S ok → $EVAL_OUT" >> "$MANIFEST"
 done
@@ -222,10 +224,14 @@ abl = Path("$ABL_DIR")
 spe = int("$STEPS_PER_EPOCH")
 
 rows = []
+this_ts = "$TS_ALL"
 for d in abl.glob("step_*"):
     meta_p = d / "ablate_meta.json"
     if not meta_p.exists(): continue
     meta = json.load(open(meta_p))
+    # filter to THIS run's cells — without this, prior ablations with
+    # different epoch sets would pollute the summary
+    if meta.get("_ts") != this_ts: continue
     sj = d / "summary.json"
     if not sj.exists():
         rows.append((meta, None, None)); continue

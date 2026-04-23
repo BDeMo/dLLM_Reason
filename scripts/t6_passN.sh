@@ -20,6 +20,9 @@
 #
 #   # Sweep ALL checkpoints in a t6_ablate training run:
 #   bash scripts/t6_passN.sh --sweep runs/training/v161_t6_ablate
+#
+#   # Plan only:
+#   bash scripts/t6_passN.sh --auto --dry_run
 
 set -euo pipefail
 
@@ -160,46 +163,64 @@ if [[ "$DRY_RUN" -eq 1 ]]; then exit 0; fi
 echo
 echo "[PASSN] aggregating summary..."
 python - <<PY
-import json, re
+import json
 from pathlib import Path
 
 base = Path("$OUT_BASE")
 rows = []
-# find run_dirs created this ts
+# find run_dirs created this TS only (avoid mixing with prior runs)
 for rd in sorted(base.glob(f"*_${TS}")):
     vj = rd / "verdict.json"
     if not vj.exists(): continue
     v = json.load(open(vj))
-    # h3_passN writes a "per_temp" dict: temp → {fail_passN, ok_passN, ...}
+    # h3_passN verdict.json structure (see compute_verdict in
+    # h3_passN_at_temperature.py:106-114):
+    #   {"fail_stats": {temp_str: {pass@1, pass@4, pass@8, n}},
+    #    "ok_stats":   {temp_str: {pass@1, pass@4, pass@8, n}},
+    #    "fail_pass@8_max":..., "ok_pass@8_max":..., "verdict":...}
     rows.append((rd.name, v))
 
 if not rows:
     print("[PASSN] no verdict.json produced — check logs.")
     raise SystemExit(0)
 
-# temps are constant per run; read from first
+# temps from first row (all runs share temps within one invocation)
 any_v = rows[0][1]
-temps = sorted(any_v.get("per_temp", {}).keys(), key=float)
+temps = sorted(any_v.get("fail_stats", {}).keys(), key=float)
+
+def fmt_pct(x):
+    try: return f"{float(x):.1%}"
+    except (TypeError, ValueError): return "—"
 
 lines = [
     "# T6 pass@N eval",
     "",
     f"N_samples={int('$N_SAMPLES')}  n_fail={int('$N_FAIL')}  n_ok={int('$N_OK')}",
     "",
-    "| ckpt | temp | fail pass@1 | fail pass@N | ok pass@1 | ok pass@N |",
-    "|---|---|---|---|---|---|",
+    "h3_passN reports pass@k for k ∈ {1, 4, 8}. pass@8 means pass@N (= n_samples) — "
+    "the column name is hard-coded in upstream regardless of N.",
+    "",
+    "| ckpt | temp | fail p@1 | fail p@4 | fail p@8 | ok p@1 | ok p@4 | ok p@8 |",
+    "|---|---|---|---|---|---|---|---|",
 ]
 for name, v in rows:
-    per = v.get("per_temp", {})
+    fs = v.get("fail_stats", {})
+    os_ = v.get("ok_stats", {})
     for T in temps:
-        d = per.get(T, {}) if T in per else per.get(str(T), {})
+        f = fs.get(T, {}) or fs.get(str(T), {})
+        o = os_.get(T, {}) or os_.get(str(T), {})
         lines.append(
             f"| {name} | {T} "
-            f"| {d.get('fail_pass@1', float('nan')):.1%} "
-            f"| {d.get('fail_pass@N', float('nan')):.1%} "
-            f"| {d.get('ok_pass@1', float('nan')):.1%} "
-            f"| {d.get('ok_pass@N', float('nan')):.1%} |"
+            f"| {fmt_pct(f.get('pass@1'))} "
+            f"| {fmt_pct(f.get('pass@4'))} "
+            f"| {fmt_pct(f.get('pass@8'))} "
+            f"| {fmt_pct(o.get('pass@1'))} "
+            f"| {fmt_pct(o.get('pass@4'))} "
+            f"| {fmt_pct(o.get('pass@8'))} |"
         )
+    lines.append(f"| {name} | (max) | "
+                 f"— | — | {fmt_pct(v.get('fail_pass@8_max'))} "
+                 f"| — | — | {fmt_pct(v.get('ok_pass@8_max'))} |")
 
 out = base / f"summary_${TS}.md"
 out.write_text("\n".join(lines), encoding="utf-8")

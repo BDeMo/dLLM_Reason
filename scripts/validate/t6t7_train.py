@@ -522,11 +522,21 @@ def main():
                     else:
                         inner.save_pretrained(dst_dir, safe_serialization=True)
 
-            # Tokenizer + trust_remote_code files — rank 0 only
+            # Tokenizer + trust_remote_code files — rank 0 only.
+            # Resolve trust_remote_code source: if init_ckpt is a local
+            # path, use it; otherwise (HF id) fall back to the project's
+            # registered local checkpoint dir checkpoints/llada-instruct/.
+            # Without this, downstream v16_eval+trust_remote_code may fail
+            # if HF cache is missing.
             if is_main:
                 if hasattr(inner_wrapper, "tokenizer"):
                     inner_wrapper.tokenizer.save_pretrained(dst_dir)
                 src_path = Path(args.init_ckpt)
+                if not (src_path.exists() and src_path.is_dir()):
+                    # init_ckpt was an HF id — fall back to local registry
+                    fallback = ROOT / "checkpoints" / "llada-instruct"
+                    if fallback.is_dir():
+                        src_path = fallback
                 if src_path.exists() and src_path.is_dir():
                     import shutil
                     for name in ("modeling_llada.py", "configuration_llada.py",
