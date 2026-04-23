@@ -200,8 +200,10 @@ class ProgressiveTrainer(Trainer):
             rand_mask,
         )
 
-        # Build x_t from mask
-        x_t = torch.where(is_masked, self.model.mask_token_id, x_0)
+        # Build x_t from mask.
+        # Use masked_fill instead of torch.where(bool, scalar, tensor) to avoid
+        # dtype promotion issues on PyTorch < 2.1 when mask_token_id is a plain int.
+        x_t = x_0.masked_fill(is_masked, self.model.mask_token_id)
 
         # Forward pass (with gradients this time)
         output = self.model.forward(x_t, t, attention_mask)

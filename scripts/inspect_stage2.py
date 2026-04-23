@@ -71,11 +71,17 @@ def load_best_map(run_dir: Path) -> dict:
 def load_episodes_for_prompt(db_path: str, prompt: str) -> list:
     """Load all episodes for a given prompt from the episode store."""
     try:
-        from dllm_reason.episodes.store import EpisodeStore
+        from dllm_reason.library.episode import EpisodeStore  # fixed: was dllm_reason.episodes.store
         store = EpisodeStore(db_path)
         all_eps = store.query(limit=100000)
         return [ep for ep in all_eps if ep.prompt == prompt]
-    except Exception:
+    except ImportError as e:
+        import warnings
+        warnings.warn(f"Could not import EpisodeStore: {e}. Episode details will be skipped.")
+        return []
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Failed to load episodes from {db_path}: {e}")
         return []
 
 

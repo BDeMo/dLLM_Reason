@@ -108,8 +108,10 @@ def generate_span_revise(
                 transfer = torch.zeros_like(x, dtype=torch.bool)
                 transfer[0, top_idx] = True
                 x[transfer] = x0[transfer]
+                # Reuse the already-computed softmax probabilities (``p``) instead
+                # of calling F.softmax a second time on the same logits.
                 committed_conf[transfer] = torch.gather(
-                    F.softmax(logits.float(), -1)[0], -1, x0[0].unsqueeze(-1)
+                    p.float()[0], -1, x0[0].unsqueeze(-1)
                 ).squeeze(-1)[transfer[0]]
 
             global_step += 1

@@ -80,6 +80,32 @@ from dllm_reason.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _resolve_prompt_len(prompt_mask: "torch.Tensor") -> int:
+    """Return a single prompt length for the whole batch.
+
+    In standard training all samples share the same prompt length, so
+    ``prompt_mask[0].sum()`` is fine.  If the batch is heterogeneous
+    (variable-length prompts), we take the *maximum* — this guarantees
+    that no prompt token is ever treated as a generation position —
+    and emit a warning so the caller can investigate.
+
+    Args:
+        prompt_mask: Boolean tensor (B, L) where True = prompt position.
+
+    Returns:
+        Integer prompt length (max across the batch).
+    """
+    prompt_lens = prompt_mask.sum(dim=-1)  # (B,)
+    if not (prompt_lens == prompt_lens[0]).all():
+        logger.warning(
+            "Heterogeneous prompt lengths in batch %s — using max (%d). "
+            "Consider using a collator that pads to uniform prompt length.",
+            prompt_lens.tolist(),
+            int(prompt_lens.max().item()),
+        )
+    return int(prompt_lens.max().item())
+
+
 @dataclass
 class RLTrainConfig:
     lr: float = 1e-5
@@ -140,6 +166,8 @@ class DiffuGRPO:
             prompt_ids = batch["input_ids"].to(device)
             prompt_mask = batch.get("prompt_mask", torch.zeros_like(prompt_ids, dtype=torch.bool)).to(device)
             B = prompt_ids.shape[0]
+            prompt_len = _resolve_prompt_len(prompt_mask)
+            gen_length  = prompt_ids.shape[1] - prompt_len
 
             all_rewards = []
             all_log_probs = []
@@ -155,7 +183,7 @@ class DiffuGRPO:
                 result = sampler.sample(
                     prompt_ids=prompt_ids,
                     prompt_mask=prompt_mask,
-                    gen_length=prompt_ids.shape[1] - int(prompt_mask[0].sum().item()),
+                    gen_length=gen_length,
                 )
 
                 # Compute log probabilities under current and reference model
@@ -394,7 +422,7 @@ class DiFFPO:
                 torch.zeros_like(prompt_ids, dtype=torch.bool),
             ).to(device)
             B = prompt_ids.shape[0]
-            prompt_len = int(prompt_mask[0].sum().item())
+            prompt_len = _resolve_prompt_len(prompt_mask)
             gen_length = prompt_ids.shape[1] - prompt_len
 
             # ── Adaptive step budget (joint sampler) ──────────────────
@@ -787,10 +815,15 @@ class UnmaskingPolicyRL:
         device = prompt_ids.device
         B, L = prompt_ids.shape
 
-        # Start with generation region fully masked
+        # Start with generation region fully masked.
+        # Compute per-sample generation start so that variable-length prompts
+        # in the same batch are handled correctly (each sample masks from its
+        # own prompt boundary, not from sample-0's boundary).
         x = prompt_ids.clone()
-        gen_start = int(prompt_mask[0].sum().item())
-        x[:, gen_start:] = self.model.mask_token_id
+        gen_starts = prompt_mask.sum(dim=-1)  # (B,) — per-sample prompt lengths
+        positions  = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
+        in_gen_region = positions >= gen_starts.unsqueeze(1)                     # (B, L)
+        x[in_gen_region] = self.model.mask_token_id
 
         # Linearly spaced noise levels 1 → 0
         ts = torch.linspace(1.0, 0.0, cfg.num_steps + 1, device=device)[:-1]
@@ -861,7 +894,7 @@ class UnmaskingPolicyRL:
                 torch.zeros_like(prompt_ids, dtype=torch.bool),
             ).to(device)
             B = prompt_ids.shape[0]
-            prompt_len = int(prompt_mask[0].sum().item())
+            prompt_len = _resolve_prompt_len(prompt_mask)
             gen_length = prompt_ids.shape[1] - prompt_len
 
             # ── REINFORCE: collect group_size rollouts ────────────────
