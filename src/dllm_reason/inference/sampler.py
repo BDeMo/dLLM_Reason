@@ -108,9 +108,11 @@ class DiffusionSampler:
         """Run block-wise denoising.
 
         Args:
-            prompt_ids:  (1, prompt_len + gen_length) — prompt tokens followed
-                         by mask tokens in the generation area.
-            prompt_mask: (1, prompt_len + gen_length) bool — True for prompt.
+            prompt_ids:  (B, prompt_len + gen_length) — prompt tokens followed
+                         by mask tokens in the generation area.  B=1 for
+                         standard inference; B>1 is supported when called from
+                         RL training loops (prompt lengths should be uniform).
+            prompt_mask: (B, prompt_len + gen_length) bool — True for prompt.
             gen_length:  number of tokens to generate.
             device:      target device.
         """
@@ -161,7 +163,20 @@ class DiffusionSampler:
         x = prompt_ids.clone().to(device)
         prompt_mask = prompt_mask.to(device)
         mask_id = self.model.mask_token_id
-        prompt_len = int(prompt_mask[0].sum().item())
+
+        # Use the *maximum* prompt length across the batch so block boundaries
+        # (b_start / b_end) are consistent for every sample.  When prompt
+        # lengths are uniform (the common case) this equals prompt_mask[0].sum().
+        # With heterogeneous prompts, using sample-0 would place block starts
+        # inside the prompt region of longer-prompt samples.
+        prompt_lens = prompt_mask.sum(dim=-1)       # (B,)
+        if not (prompt_lens == prompt_lens[0]).all():
+            logger.warning(
+                "DiffusionSampler: heterogeneous prompt lengths %s — "
+                "using max (%d) for block boundaries.",
+                prompt_lens.tolist(), int(prompt_lens.max().item()),
+            )
+        prompt_len = int(prompt_lens.max().item())
 
         # True for prompt positions — used for CFG unconditional branch
         prompt_index = prompt_mask.clone()
