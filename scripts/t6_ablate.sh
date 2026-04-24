@@ -67,12 +67,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
+# Cap parallelism to actual cell count (#epochs → #eval cells)
+N_CELLS="${#EPOCHS[@]}"
+if [[ "$EVAL_GPUS" -gt "$N_CELLS" ]]; then
+    echo "[ABL]   cap EVAL_GPUS $EVAL_GPUS → $N_CELLS (n_cells = $N_CELLS)"
+    EVAL_GPUS=$N_CELLS
+fi
+
 # Resolve which GPU indices to dispatch to:
 #   --gpus 0,2,4        → explicit list, EVAL_GPUS := len
 #   --auto_gpus         → query nvidia-smi for EVAL_GPUS least-busy
 #   (default)           → sequential 0..EVAL_GPUS-1
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    if [[ "${#GPUS_ARR[@]}" -gt "$N_CELLS" ]]; then
+        GPUS_ARR=("${GPUS_ARR[@]:0:$N_CELLS}")
+    fi
     EVAL_GPUS="${#GPUS_ARR[@]}"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"

@@ -120,11 +120,20 @@ echo "[PASSN]   n_fail / n_ok = $N_FAIL / $N_OK"
 echo "[PASSN]   gen/block/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
 echo "[PASSN] ============================================================"
 
+# Cap to actual number of ckpts (no point reserving GPUs we won't use)
+N_CELLS="${#CKPT_LIST[@]}"
+if [[ "$EVAL_GPUS" -gt "$N_CELLS" ]]; then
+    echo "[PASSN]   cap EVAL_GPUS $EVAL_GPUS → $N_CELLS (n_ckpts = $N_CELLS)"
+    EVAL_GPUS=$N_CELLS
+fi
 echo "[PASSN]   EVAL_GPUS      = $EVAL_GPUS (ckpts run in parallel)"
 
 # Resolve GPU indices
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    if [[ "${#GPUS_ARR[@]}" -gt "$N_CELLS" ]]; then
+        GPUS_ARR=("${GPUS_ARR[@]:0:$N_CELLS}")
+    fi
     EVAL_GPUS="${#GPUS_ARR[@]}"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"

@@ -88,11 +88,23 @@ echo "[DEC-ABL]   temps       = ${TEMPS[*]}"
 echo "[DEC-ABL]   n_samples   = ${N_SAMPLES_LIST[*]}"
 echo "[DEC-ABL]   n_fail/ok   = $N_FAIL / $N_OK  (full=331/988)"
 echo "[DEC-ABL]   gen/bl/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
-echo "[DEC-ABL]   eval_gpus   = $EVAL_GPUS"
+# Cap parallelism to actual cell count — no point reserving 8 GPUs for
+# 3 cells (wastes auto_gpus picks that other work could use).
+N_CELLS=$(( ${#TEMPS[@]} * ${#N_SAMPLES_LIST[@]} ))
+if [[ "$EVAL_GPUS" -gt "$N_CELLS" ]]; then
+    echo "[DEC-ABL]   cap EVAL_GPUS $EVAL_GPUS → $N_CELLS (n_cells = $N_CELLS)"
+    EVAL_GPUS=$N_CELLS
+fi
+echo "[DEC-ABL]   eval_gpus   = $EVAL_GPUS  (for $N_CELLS cells)"
 
 # Resolve GPU indices
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    # explicit list — user chose; don't cap beyond cell count but warn
+    if [[ "${#GPUS_ARR[@]}" -gt "$N_CELLS" ]]; then
+        GPUS_ARR=("${GPUS_ARR[@]:0:$N_CELLS}")
+        echo "[DEC-ABL]   trimmed --gpus to first $N_CELLS (matches cells)"
+    fi
     EVAL_GPUS="${#GPUS_ARR[@]}"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"
