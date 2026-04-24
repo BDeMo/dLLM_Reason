@@ -38,6 +38,8 @@ EVAL_GEN_LENGTH=128
 EVAL_BLOCK_LENGTH=32
 EVAL_TEMPERATURE=0
 EVAL_GPUS=8                     # parallel eval across this many GPUs
+GPU_CSV=""                      # explicit CSV list (e.g. 0,2,4,6)
+AUTO_GPUS=0                     # pick least-busy GPUs via nvidia-smi
 BASELINE_CKPT="GSAI-ML/LLaDA-8B-Instruct"
 
 RANKS_CSV="1,2,4,8,16"
@@ -48,6 +50,8 @@ while [[ $# -gt 0 ]]; do
         --ranks)     RANKS_CSV="$2"; shift 2 ;;
         --epochs)    EPOCHS_CSV="$2"; shift 2 ;;
         --eval_gpus) EVAL_GPUS="$2"; shift 2 ;;
+        --gpus)      GPU_CSV="$2"; shift 2 ;;
+        --auto_gpus) AUTO_GPUS=1; shift ;;
         --dry_run)   DRY_RUN=1; shift ;;
         -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[LORA-ABL] unknown arg: $1" >&2; exit 1 ;;
@@ -111,6 +115,20 @@ echo "[LORA-ABL] data: $T6_SFT_JSONL"
 
 LAUNCH="torchrun --standalone --nproc_per_node=$SFT_GPUS"
 [[ "$SFT_GPUS" -le 1 ]] && LAUNCH="python"
+
+# Resolve which GPU indices to dispatch eval to (Phase B only; training
+# uses torchrun across all SFT_GPUS cards which it sees by default).
+if [[ -n "$GPU_CSV" ]]; then
+    IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    EVAL_GPUS="${#GPUS_ARR[@]}"
+elif [[ "$AUTO_GPUS" -eq 1 ]]; then
+    source "$SCRIPT_DIR/_select_gpus.sh"
+    SEL=$(select_free_gpus "$EVAL_GPUS")
+    IFS=',' read -r -a GPUS_ARR <<< "$SEL"
+    echo "[LORA-ABL] auto-selected eval GPUs: $SEL"
+else
+    GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
+fi
 
 # ── Phase A: one training per rank ───────────────────────────────────────
 for R in "${RANKS[@]}"; do
@@ -238,9 +256,10 @@ for R in "${RANKS[@]}"; do
         }
         EVAL_OUT="$ABL_DIR/r${R}_step${S}"
         EVAL_LOG="$LOG_DIR/lora_r${R}_eval_step${S}_${TS_ALL}.log"
-        echo "[LORA-ABL]   launching r=$R step=$S on GPU $g → $EVAL_OUT"
+        GPU="${GPUS_ARR[$g]}"
+        echo "[LORA-ABL]   launching r=$R step=$S on GPU $GPU (slot $g) → $EVAL_OUT"
 
-        CUDA_VISIBLE_DEVICES=$g python scripts/validate/v16_eval.py \
+        CUDA_VISIBLE_DEVICES=$GPU python scripts/validate/v16_eval.py \
             --ckpts "t6=$HF_CKPT" \
             --out_dir "$EVAL_OUT" \
             --gen_length "$EVAL_GEN_LENGTH" \

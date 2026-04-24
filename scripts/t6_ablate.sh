@@ -46,12 +46,16 @@ EVAL_GEN_LENGTH=128
 EVAL_BLOCK_LENGTH=32
 EVAL_TEMPERATURE=0
 EVAL_GPUS=8                     # parallel eval across this many GPUs
+GPU_CSV=""                      # explicit CSV list (e.g. 0,2,4,6)
+AUTO_GPUS=0                     # pick least-busy GPUs via nvidia-smi
 BASELINE_CKPT="GSAI-ML/LLaDA-8B-Instruct"
 
 EPOCHS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --eval_gpus) EVAL_GPUS="$2"; shift 2 ;;
+        --gpus)      GPU_CSV="$2"; shift 2 ;;
+        --auto_gpus) AUTO_GPUS=1; shift ;;
         --dry_run)   DRY_RUN=1; shift ;;
         -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) EPOCHS+=("$1"); shift ;;
@@ -62,6 +66,22 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
+
+# Resolve which GPU indices to dispatch to:
+#   --gpus 0,2,4        → explicit list, EVAL_GPUS := len
+#   --auto_gpus         → query nvidia-smi for EVAL_GPUS least-busy
+#   (default)           → sequential 0..EVAL_GPUS-1
+if [[ -n "$GPU_CSV" ]]; then
+    IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    EVAL_GPUS="${#GPUS_ARR[@]}"
+elif [[ "$AUTO_GPUS" -eq 1 ]]; then
+    source "$SCRIPT_DIR/_select_gpus.sh"
+    SEL=$(select_free_gpus "$EVAL_GPUS")
+    IFS=',' read -r -a GPUS_ARR <<< "$SEL"
+    echo "[ABL] auto-selected GPUs: $SEL"
+else
+    GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
+fi
 
 ABL_DIR="$ROOT/runs/validation/t6_ablate"
 TRAIN_DIR_NAME="v161_t6_ablate"
@@ -172,8 +192,9 @@ for S in "${STEPS_ARR[@]}"; do
     fi
     EVAL_OUT="$ABL_DIR/step_${S}"
     EVAL_LOG="$LOG_DIR/ablate_eval_step${S}_${TS_ALL}.log"
-    echo "[ABL]   launching eval step=$S on GPU $g  → $EVAL_OUT"
-    CUDA_VISIBLE_DEVICES=$g python scripts/validate/v16_eval.py \
+    GPU="${GPUS_ARR[$g]}"
+    echo "[ABL]   launching eval step=$S on GPU $GPU (slot $g)  → $EVAL_OUT"
+    CUDA_VISIBLE_DEVICES=$GPU python scripts/validate/v16_eval.py \
         --ckpts "t6=$HF_CKPT" \
         --out_dir "$EVAL_OUT" \
         --gen_length "$EVAL_GEN_LENGTH" \

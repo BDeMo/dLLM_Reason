@@ -26,6 +26,7 @@ TEMPS=(0.3 0.7 1.0)
 N_FAIL=30
 N_OK=30
 EVAL_GPUS=8
+PASS_GPU_FLAGS=()           # forwarded to t6_passN.sh
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,6 +35,8 @@ while [[ $# -gt 0 ]]; do
         --n_fail)    N_FAIL="$2"; shift 2 ;;
         --n_ok)      N_OK="$2"; shift 2 ;;
         --eval_gpus) EVAL_GPUS="$2"; shift 2 ;;
+        --gpus)      PASS_GPU_FLAGS+=(--gpus "$2"); shift 2 ;;
+        --auto_gpus) PASS_GPU_FLAGS+=(--auto_gpus); shift ;;
         --temps)     shift; TEMPS=(); while [[ $# -gt 0 && "$1" != --* ]]; do TEMPS+=("$1"); shift; done ;;
         -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[LORA-PASSN] unknown arg: $1" >&2; exit 1 ;;
@@ -67,6 +70,7 @@ for R in "${RANKS[@]}"; do
         --n_samples "$N_SAMPLES" \
         --n_fail "$N_FAIL" --n_ok "$N_OK" \
         --eval_gpus "$EVAL_GPUS" \
+        "${PASS_GPU_FLAGS[@]:-}" \
         --temps "${TEMPS[@]}"
 done
 

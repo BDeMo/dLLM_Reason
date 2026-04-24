@@ -45,6 +45,8 @@ STEPS_=128
 N_FAIL=331                   # FULL scope_fail
 N_OK=988                     # FULL scope_ok
 EVAL_GPUS=8
+GPU_CSV=""
+AUTO_GPUS=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
         --n_fail)          N_FAIL="$2"; shift 2 ;;
         --n_ok)            N_OK="$2"; shift 2 ;;
         --eval_gpus)       EVAL_GPUS="$2"; shift 2 ;;
+        --gpus)            GPU_CSV="$2"; shift 2 ;;
+        --auto_gpus)       AUTO_GPUS=1; shift ;;
         --dry_run)         DRY_RUN=1; shift ;;
         -h|--help)         grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[DEC-ABL] unknown arg: $1" >&2; exit 1 ;;
@@ -85,6 +89,20 @@ echo "[DEC-ABL]   n_samples   = ${N_SAMPLES_LIST[*]}"
 echo "[DEC-ABL]   n_fail/ok   = $N_FAIL / $N_OK  (full=331/988)"
 echo "[DEC-ABL]   gen/bl/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
 echo "[DEC-ABL]   eval_gpus   = $EVAL_GPUS"
+
+# Resolve GPU indices
+if [[ -n "$GPU_CSV" ]]; then
+    IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    EVAL_GPUS="${#GPUS_ARR[@]}"
+elif [[ "$AUTO_GPUS" -eq 1 ]]; then
+    source "$SCRIPT_DIR/_select_gpus.sh"
+    SEL=$(select_free_gpus "$EVAL_GPUS")
+    IFS=',' read -r -a GPUS_ARR <<< "$SEL"
+    echo "[DEC-ABL]   auto-GPUs   = $SEL"
+else
+    GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
+fi
+
 echo "[DEC-ABL]   out base    = $OUT_BASE"
 echo "[DEC-ABL] ============================================================"
 
@@ -98,10 +116,11 @@ for N in "${N_SAMPLES_LIST[@]}"; do
         RUN_DIR="$OUT_BASE/${CELL}_${TS}"
         LOG="$LOG_DIR/dec_ablate_${CKPT_LABEL}_${CELL}_${TS}.log"
 
-        echo "[DEC-ABL]   launch T=$T N=$N on GPU $g → $RUN_DIR"
+        GPU="${GPUS_ARR[$g]}"
+        echo "[DEC-ABL]   launch T=$T N=$N on GPU $GPU (slot $g) → $RUN_DIR"
         [[ "$DRY_RUN" -eq 1 ]] && continue
 
-        CUDA_VISIBLE_DEVICES=$g PYTHONUNBUFFERED=1 python -u \
+        CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 python -u \
             scripts/validate/h3_passN_at_temperature.py \
             --model "$CKPT" \
             --run_dir "$RUN_DIR" \

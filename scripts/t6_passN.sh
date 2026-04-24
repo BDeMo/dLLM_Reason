@@ -37,6 +37,8 @@ TEMPS=(0.3 0.7 1.0)
 N_FAIL=30
 N_OK=30
 EVAL_GPUS=8                     # parallel ckpts across this many GPUs
+GPU_CSV=""
+AUTO_GPUS=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -52,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --n_fail)       N_FAIL="$2"; shift 2 ;;
         --n_ok)         N_OK="$2"; shift 2 ;;
         --eval_gpus)    EVAL_GPUS="$2"; shift 2 ;;
+        --gpus)         GPU_CSV="$2"; shift 2 ;;
+        --auto_gpus)    AUTO_GPUS=1; shift ;;
         --dry_run)      DRY_RUN=1; shift ;;
         -h|--help)      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[PASSN] unknown arg: $1" >&2; exit 1 ;;
@@ -117,6 +121,19 @@ echo "[PASSN]   gen/block/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
 echo "[PASSN] ============================================================"
 
 echo "[PASSN]   EVAL_GPUS      = $EVAL_GPUS (ckpts run in parallel)"
+
+# Resolve GPU indices
+if [[ -n "$GPU_CSV" ]]; then
+    IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    EVAL_GPUS="${#GPUS_ARR[@]}"
+elif [[ "$AUTO_GPUS" -eq 1 ]]; then
+    source "$SCRIPT_DIR/_select_gpus.sh"
+    SEL=$(select_free_gpus "$EVAL_GPUS")
+    IFS=',' read -r -a GPUS_ARR <<< "$SEL"
+    echo "[PASSN]   auto-selected  = $SEL"
+else
+    GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
+fi
 echo
 
 declare -a PIDS=()
@@ -129,10 +146,11 @@ for CK in "${CKPT_LIST[@]}"; do
     RUN_DIR="$OUT_BASE/${PARENT}_${LABEL}_${TS}"
     LOG="$OUT_BASE/${PARENT}_${LABEL}_${TS}.log"
 
-    echo "[PASSN] launching on GPU $g: ckpt=$CK → $RUN_DIR"
+    GPU="${GPUS_ARR[$g]}"
+    echo "[PASSN] launching on GPU $GPU (slot $g): ckpt=$CK → $RUN_DIR"
     [[ "$DRY_RUN" -eq 1 ]] && { echo "[PASSN]   (dry-run, skip)"; continue; }
 
-    CUDA_VISIBLE_DEVICES=$g PYTHONUNBUFFERED=1 python -u \
+    CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 python -u \
         scripts/validate/h3_passN_at_temperature.py \
         --model "$CK" \
         --run_dir "$RUN_DIR" \
