@@ -108,7 +108,9 @@ def main():
         {
             "idx": i,
             "prompt": scope_fail[i]["prompt"] if i < len(scope_fail) else None,
-            "gt":     scope_fail[i].get("answer", scope_fail[i].get("gt"))
+            "gt":     (scope_fail[i].get("ground_truth")
+                       or scope_fail[i].get("answer")
+                       or scope_fail[i].get("gt"))
                       if i < len(scope_fail) else None,
         }
         for i in hardset
