@@ -113,22 +113,36 @@ fi
 [[ ! -f "$T6_SFT_JSONL" ]] && { echo "[LORA-ABL] ERROR: $T6_SFT_JSONL missing" >&2; exit 1; }
 echo "[LORA-ABL] data: $T6_SFT_JSONL"
 
-LAUNCH="torchrun --standalone --nproc_per_node=$SFT_GPUS"
-[[ "$SFT_GPUS" -le 1 ]] && LAUNCH="python"
-
-# Resolve which GPU indices to dispatch eval to (Phase B only; training
-# uses torchrun across all SFT_GPUS cards which it sees by default).
+# Resolve GPU constraint FIRST — applies to all 3 phases:
+#   Phase A  (training)  → torchrun sees only these N cards, nproc=N
+#   Phase A.5 (merge)    → uses GPUS_ARR[0] instead of hardcoded cuda:0
+#   Phase B  (eval)      → round-robin GPUS_ARR
+# Whole pipeline stays on user's chosen cards.
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
+    SFT_GPUS="${#GPUS_ARR[@]}"    # training shrinks to match
     EVAL_GPUS="${#GPUS_ARR[@]}"
+    echo "[LORA-ABL] --gpus=$GPU_CSV constrains WHOLE pipeline (train+merge+eval)"
+    echo "[LORA-ABL]   SFT_GPUS  = $SFT_GPUS  (nproc_per_node for torchrun)"
+    echo "[LORA-ABL]   EVAL_GPUS = $EVAL_GPUS"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"
+    # Pick enough for eval-parallel; training will use the same set
     SEL=$(select_free_gpus "$EVAL_GPUS")
     IFS=',' read -r -a GPUS_ARR <<< "$SEL"
-    echo "[LORA-ABL] auto-selected eval GPUs: $SEL"
+    SFT_GPUS="${#GPUS_ARR[@]}"
+    echo "[LORA-ABL] auto-selected GPUs = $SEL  (train+merge+eval)"
+    echo "[LORA-ABL]   SFT_GPUS  = $SFT_GPUS"
+    echo "[LORA-ABL]   EVAL_GPUS = $EVAL_GPUS"
 else
     GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
 fi
+
+# CVD string for phase-prefix so torchrun / python see only the chosen cards
+CVD=$(IFS=,; echo "${GPUS_ARR[*]}")
+
+LAUNCH="torchrun --standalone --nproc_per_node=$SFT_GPUS"
+[[ "$SFT_GPUS" -le 1 ]] && LAUNCH="python"
 
 # ── Phase A: one training per rank ───────────────────────────────────────
 for R in "${RANKS[@]}"; do
@@ -149,7 +163,7 @@ for R in "${RANKS[@]}"; do
         continue
     fi
 
-    if ! $LAUNCH scripts/validate/t6t7_train.py \
+    if ! CUDA_VISIBLE_DEVICES="$CVD" $LAUNCH scripts/validate/t6t7_train.py \
             --jsonl_path "$T6_SFT_JSONL" \
             --run_name "$RUN_NAME" \
             --init_ckpt "$BASELINE_CKPT" \
@@ -195,7 +209,7 @@ for R in "${RANKS[@]}"; do
             continue
         fi
         echo "[LORA-ABL]   merge r=$R step=$S  →  $MERGED_DIR"
-        CUDA_VISIBLE_DEVICES=0 python - <<PY
+        CUDA_VISIBLE_DEVICES=${GPUS_ARR[0]} python - <<PY
 import sys, shutil
 from pathlib import Path
 from transformers import AutoModel, AutoTokenizer

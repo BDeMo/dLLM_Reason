@@ -74,24 +74,34 @@ if [[ "$EVAL_GPUS" -gt "$N_CELLS" ]]; then
     EVAL_GPUS=$N_CELLS
 fi
 
-# Resolve which GPU indices to dispatch to:
-#   --gpus 0,2,4        → explicit list, EVAL_GPUS := len
-#   --auto_gpus         → query nvidia-smi for EVAL_GPUS least-busy
-#   (default)           → sequential 0..EVAL_GPUS-1
+# Resolve GPU constraint for WHOLE pipeline (training + eval):
+#   --gpus / --auto_gpus pin BOTH Phase 1 (torchrun training) and Phase
+#   2 (parallel eval). SFT_GPUS shrinks to match so nproc_per_node is
+#   correct. Previously --gpus only affected eval, which was misleading.
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
     if [[ "${#GPUS_ARR[@]}" -gt "$N_CELLS" ]]; then
-        GPUS_ARR=("${GPUS_ARR[@]:0:$N_CELLS}")
+        GPUS_ARR_EVAL=("${GPUS_ARR[@]:0:$N_CELLS}")
+    else
+        GPUS_ARR_EVAL=("${GPUS_ARR[@]}")
     fi
-    EVAL_GPUS="${#GPUS_ARR[@]}"
+    SFT_GPUS="${#GPUS_ARR[@]}"   # training uses ALL user-chosen cards
+    EVAL_GPUS="${#GPUS_ARR_EVAL[@]}"
+    echo "[ABL] --gpus=$GPU_CSV constrains WHOLE pipeline"
+    echo "[ABL]   SFT_GPUS  = $SFT_GPUS (training)"
+    echo "[ABL]   EVAL_GPUS = $EVAL_GPUS (eval parallelism)"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"
-    SEL=$(select_free_gpus "$EVAL_GPUS")
+    # pick SFT-size for training, use first N_CELLS for eval round-robin
+    SEL=$(select_free_gpus "$SFT_GPUS")
     IFS=',' read -r -a GPUS_ARR <<< "$SEL"
-    echo "[ABL] auto-selected GPUs: $SEL"
+    GPUS_ARR_EVAL=("${GPUS_ARR[@]:0:$EVAL_GPUS}")
+    echo "[ABL] auto-selected GPUs = $SEL"
 else
-    GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
+    GPUS_ARR=();      for i in $(seq 0 $((SFT_GPUS - 1)));  do GPUS_ARR+=("$i");      done
+    GPUS_ARR_EVAL=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR_EVAL+=("$i"); done
 fi
+CVD=$(IFS=,; echo "${GPUS_ARR[*]}")
 
 ABL_DIR="$ROOT/runs/validation/t6_ablate"
 TRAIN_DIR_NAME="v161_t6_ablate"
@@ -165,7 +175,7 @@ echo "[ABL] launching torchrun  log: $TRAIN_LOG"
 LAUNCH="torchrun --standalone --nproc_per_node=$SFT_GPUS"
 [[ "$SFT_GPUS" -le 1 ]] && LAUNCH="python"
 
-if ! "${dry_flag[@]}" $LAUNCH scripts/validate/t6t7_train.py \
+if ! "${dry_flag[@]}" CUDA_VISIBLE_DEVICES="$CVD" $LAUNCH scripts/validate/t6t7_train.py \
         --jsonl_path "$T6_SFT_JSONL" \
         --run_name "$TRAIN_DIR_NAME" \
         --init_ckpt "$BASELINE_CKPT" \
@@ -202,7 +212,7 @@ for S in "${STEPS_ARR[@]}"; do
     fi
     EVAL_OUT="$ABL_DIR/step_${S}"
     EVAL_LOG="$LOG_DIR/ablate_eval_step${S}_${TS_ALL}.log"
-    GPU="${GPUS_ARR[$g]}"
+    GPU="${GPUS_ARR_EVAL[$g]}"
     echo "[ABL]   launching eval step=$S on GPU $GPU (slot $g)  → $EVAL_OUT"
     CUDA_VISIBLE_DEVICES=$GPU python scripts/validate/v16_eval.py \
         --ckpts "t6=$HF_CKPT" \
