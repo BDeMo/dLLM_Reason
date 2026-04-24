@@ -157,76 +157,15 @@ for i in "${!PIDS[@]}"; do
     wait "${PIDS[$i]}" || echo "[PASSN] ✗ ${PID_LABELS[$i]} FAILED"
 done
 
-# ── aggregate summary ─────────────────────────────────────────────────────
+# ── aggregate via standalone script (single source of truth) ─────────────
+# Previously had an inline aggregator here that conflicted with
+# scripts/t6_passN_aggregate.py — both wrote to t6_passN/summary.md
+# with different semantics (TS-filtered batch vs full history).
+# Now delegate to the standalone, which full-scans every subdir.
 if [[ "$DRY_RUN" -eq 1 ]]; then exit 0; fi
 
 echo
-echo "[PASSN] aggregating summary..."
-python - <<PY
-import json
-from pathlib import Path
-
-base = Path("$OUT_BASE")
-rows = []
-# find run_dirs created this TS only (avoid mixing with prior runs)
-for rd in sorted(base.glob(f"*_${TS}")):
-    vj = rd / "verdict.json"
-    if not vj.exists(): continue
-    v = json.load(open(vj))
-    # h3_passN verdict.json structure (see compute_verdict in
-    # h3_passN_at_temperature.py:106-114):
-    #   {"fail_stats": {temp_str: {pass@1, pass@4, pass@8, n}},
-    #    "ok_stats":   {temp_str: {pass@1, pass@4, pass@8, n}},
-    #    "fail_pass@8_max":..., "ok_pass@8_max":..., "verdict":...}
-    rows.append((rd.name, v))
-
-if not rows:
-    print("[PASSN] no verdict.json produced — check logs.")
-    raise SystemExit(0)
-
-# temps from first row (all runs share temps within one invocation)
-any_v = rows[0][1]
-temps = sorted(any_v.get("fail_stats", {}).keys(), key=float)
-
-def fmt_pct(x):
-    try: return f"{float(x):.1%}"
-    except (TypeError, ValueError): return "—"
-
-lines = [
-    "# T6 pass@N eval",
-    "",
-    f"N_samples={int('$N_SAMPLES')}  n_fail={int('$N_FAIL')}  n_ok={int('$N_OK')}",
-    "",
-    "h3_passN reports pass@k for k ∈ {1, 4, 8}. pass@8 means pass@N (= n_samples) — "
-    "the column name is hard-coded in upstream regardless of N.",
-    "",
-    "| ckpt | temp | fail p@1 | fail p@4 | fail p@8 | ok p@1 | ok p@4 | ok p@8 |",
-    "|---|---|---|---|---|---|---|---|",
-]
-for name, v in rows:
-    fs = v.get("fail_stats", {})
-    os_ = v.get("ok_stats", {})
-    for T in temps:
-        f = fs.get(T, {}) or fs.get(str(T), {})
-        o = os_.get(T, {}) or os_.get(str(T), {})
-        lines.append(
-            f"| {name} | {T} "
-            f"| {fmt_pct(f.get('pass@1'))} "
-            f"| {fmt_pct(f.get('pass@4'))} "
-            f"| {fmt_pct(f.get('pass@8'))} "
-            f"| {fmt_pct(o.get('pass@1'))} "
-            f"| {fmt_pct(o.get('pass@4'))} "
-            f"| {fmt_pct(o.get('pass@8'))} |"
-        )
-    lines.append(f"| {name} | (max) | "
-                 f"— | — | {fmt_pct(v.get('fail_pass@8_max'))} "
-                 f"| — | — | {fmt_pct(v.get('ok_pass@8_max'))} |")
-
-out = base / f"summary_${TS}.md"
-out.write_text("\n".join(lines), encoding="utf-8")
-(base / "summary.md").write_text("\n".join(lines), encoding="utf-8")
-print(open(out).read())
-print(f"\n[PASSN] summary → {out}")
-PY
+echo "[PASSN] aggregating via t6_passN_aggregate.py ..."
+python scripts/t6_passN_aggregate.py --dir "$OUT_BASE"
 
 echo "[PASSN] done. → $OUT_BASE"
