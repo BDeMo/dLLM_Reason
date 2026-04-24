@@ -71,5 +71,5 @@ for R in "${RANKS[@]}"; do
 done
 
 echo
-echo "[LORA-PASSN] done. Aggregate all (full-SFT + LoRA) results:"
-echo "    python scripts/t6_passN_aggregate.py"
+echo "[LORA-PASSN] auto-aggregating all (full-SFT + LoRA) pass@N results..."
+python scripts/t6_passN_aggregate.py
