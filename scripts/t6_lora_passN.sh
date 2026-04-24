@@ -70,7 +70,7 @@ for R in "${RANKS[@]}"; do
         --n_samples "$N_SAMPLES" \
         --n_fail "$N_FAIL" --n_ok "$N_OK" \
         --eval_gpus "$EVAL_GPUS" \
-        "${PASS_GPU_FLAGS[@]:-}" \
+        ${PASS_GPU_FLAGS[@]+"${PASS_GPU_FLAGS[@]}"} \
         --temps "${TEMPS[@]}"
 done
 
