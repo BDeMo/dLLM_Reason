@@ -153,7 +153,7 @@ def main():
     # Lazy import
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from h1_remask_rescue import generate, _get_mask_token_id, is_correct
+    from h1_remask_rescue import generate, _get_mask_token_id, is_correct, extract_answer
 
     print(f"[H3] loading {args.model} ...")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -166,17 +166,23 @@ def main():
         prompt, gt = rec["prompt"], rec["ground_truth"]
         row = {"group": group, "idx": idx, "gt": gt, "temps": {}}
         for T in args.temps:
-            corrects = []
+            corrects, answers = [], []
             for _ in range(args.n_samples):
                 out = generate(model, tok, prompt,
                                gen_length=args.gen_length, steps=args.steps,
                                block_length=args.block_length, temperature=T,
                                revise_every=0, mask_id=mask_id)
                 corrects.append(is_correct(out, gt))
+                # Persist extracted numeric answer per sample so SC / BoN
+                # post-processors can compute mode / rank without re-running
+                # inference. None = no number parsed.
+                a = extract_answer(out)
+                answers.append(None if a is None else float(a))
             p1 = pass_at_k(corrects, 1)
             p4 = pass_at_k(corrects, min(4, args.n_samples))
             p8 = pass_at_k(corrects, args.n_samples)
             row["temps"][str(T)] = {"correct_list": [bool(c) for c in corrects],
+                                    "answer_list": answers,
                                     "pass@1": p1, "pass@4": p4, "pass@8": p8}
         rd.save_prompt_group(group, idx, row)
         return row
