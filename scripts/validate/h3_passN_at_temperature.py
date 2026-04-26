@@ -124,11 +124,13 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
-    ap.add_argument("--prompt_batch", type=int, default=8,
+    ap.add_argument("--prompt_batch", default="auto",
                     help="cross-prompt batching: stack P prompts × N samples "
-                         "into one forward (B=P*N). Saturates A100 vs single "
-                         "prompt B=N. Default 8 → B=64 at N=8 fits ≤80GB. "
-                         "Set 1 to disable cross-prompt batching.")
+                         "into one forward (B=P*N). 'auto' (default) probes "
+                         "at startup, finding the largest P that fits memory "
+                         "given worst-case prompt length. Or pass an int to "
+                         "force a value. Set 1 to disable cross-prompt "
+                         "batching (single-prompt B=N).")
     ap.add_argument("--prompt_shard", default="0/1",
                     help="<idx>/<total> — round-robin partition of (fail+ok) "
                          "prompts across shards. Each shard processes prompts "
@@ -186,7 +188,72 @@ def main():
     mask_id = _get_mask_token_id(model, tok)
     print(f"[H3] mask_id = {mask_id}")
 
-    P_BATCH = max(1, int(args.prompt_batch))
+    # ── Resolve (P_BATCH, N_INNER) — auto-probe or explicit ────────────────
+    # Strategy: probe forward passes at decreasing B = P × N_inner candidates;
+    # pick the largest one that fits worst-case prompt length without OOM.
+    # N_total = args.n_samples (metric requirement). N_inner ≤ N_total; we
+    # iterate ceil(N_total / N_inner) times if needed to collect N_total
+    # samples per prompt.
+    N_TOTAL = args.n_samples
+
+    def _autotune_batch():
+        from itertools import product
+        # Worst-case sequence length: tokenize each prompt header
+        all_prompts = ([rec["prompt"] for rec in fail_prompts]
+                       + [rec["prompt"] for rec in ok_prompts])
+        worst_real = 0
+        for p in all_prompts:
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": p}],
+                add_generation_prompt=True, tokenize=False)
+            worst_real = max(worst_real, len(tok(text)["input_ids"]))
+        L = worst_real + args.gen_length
+        print(f"[H3] autotune: worst_prompt={worst_real}, total_seq_L={L}")
+
+        # Candidates: (P, N_inner). Prefer larger B; among ties prefer P
+        # since cross-prompt is more SM-saturating than within-prompt.
+        Ps = [16, 12, 8, 4, 2, 1]
+        Ns = sorted({N_TOTAL, max(1, N_TOTAL // 2),
+                     max(1, N_TOTAL // 4), 1}, reverse=True)
+        cands = sorted({(P, N) for P, N in product(Ps, Ns)},
+                       key=lambda pn: (-(pn[0] * pn[1]), -pn[0]))
+
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        attn_kw_ok = True
+        for P, N_in in cands:
+            B = P * N_in
+            try:
+                torch.cuda.empty_cache()
+                x = torch.full((B, L), mask_id, dtype=torch.long, device="cuda")
+                attn = torch.ones((B, L), dtype=torch.long, device="cuda")
+                with torch.no_grad():
+                    if attn_kw_ok:
+                        try:
+                            _ = model(x, attention_mask=attn).logits
+                        except TypeError:
+                            attn_kw_ok = False
+                            _ = model(x).logits
+                    else:
+                        _ = model(x).logits
+                del x, attn
+                torch.cuda.empty_cache()
+                print(f"[H3] autotune: ✓ P={P}, N_inner={N_in} (B={B}) fits")
+                return P, N_in
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print(f"[H3] autotune: ✗ P={P}, N_inner={N_in} (B={B}) OOM")
+                continue
+        print("[H3] autotune: nothing fits — fallback to (1, 1)")
+        return 1, 1
+
+    pb_arg = str(args.prompt_batch).strip().lower()
+    if pb_arg in ("auto", "0"):
+        P_BATCH, N_INNER = _autotune_batch()
+    else:
+        P_BATCH = max(1, int(pb_arg))
+        N_INNER = N_TOTAL
+    print(f"[H3] using P_BATCH={P_BATCH}, N_INNER={N_INNER}, "
+          f"N_TOTAL={N_TOTAL}, B={P_BATCH*N_INNER}")
 
     def _build_temp_row(T, outs, gt):
         """Compute correct/answer lists + pass@k metrics for one (T, prompt) cell."""
@@ -201,19 +268,34 @@ def main():
                 "pass@8": pass_at_k(corrects, n_s)}
 
     def run_batch(group: str, idxs: list[int], recs: list[dict]):
-        """Process P prompts together (B = P × N) in each diffusion forward.
-        For T=0 we still go single-prompt batched path (P=batch but N=1
-        replicated); generate_batched_multi handles N=1 fine but the cheaper
-        path is a per-prompt B=1 generate() loop. Done as fallback."""
+        """Process P_BATCH prompts together (B = P × N_inner per forward).
+        If N_INNER < N_TOTAL, iterate ceil(N_TOTAL/N_INNER) times collecting
+        N_TOTAL samples per prompt."""
         prompts = [r["prompt"] for r in recs]
         gts     = [r["ground_truth"] for r in recs]
         rows = [{"group": group, "idx": i, "gt": g, "temps": {}}
                 for i, g in zip(idxs, gts)]
 
+        def _collect_samples(prompts, T, n_target):
+            """Collect n_target samples per prompt via N_INNER-sized forwards."""
+            collected = [[] for _ in prompts]
+            iters = (n_target + N_INNER - 1) // N_INNER
+            for _ in range(iters):
+                outs = generate_batched_multi(
+                    model, tok, prompts,
+                    n_samples=N_INNER,
+                    gen_length=args.gen_length, steps=args.steps,
+                    block_length=args.block_length, temperature=T,
+                    mask_id=mask_id,
+                )
+                for p_idx, group_outs in enumerate(outs):
+                    collected[p_idx].extend(group_outs)
+            # trim to exactly n_target (last iter may overshoot)
+            return [grp[:n_target] for grp in collected]
+
         for T in args.temps:
             if T == 0.0:
-                # Deterministic: 1 sample per prompt suffices. We can still
-                # cross-prompt-batch with N=1 to keep GPU saturated.
+                # Deterministic: 1 sample suffices, replicate N times.
                 outs_per_prompt = generate_batched_multi(
                     model, tok, prompts,
                     n_samples=1,
@@ -221,16 +303,9 @@ def main():
                     block_length=args.block_length, temperature=0.0,
                     mask_id=mask_id,
                 )
-                # Replicate the single sample N times for metric uniformity
-                outs_per_prompt = [grp * args.n_samples for grp in outs_per_prompt]
+                outs_per_prompt = [grp * N_TOTAL for grp in outs_per_prompt]
             else:
-                outs_per_prompt = generate_batched_multi(
-                    model, tok, prompts,
-                    n_samples=args.n_samples,
-                    gen_length=args.gen_length, steps=args.steps,
-                    block_length=args.block_length, temperature=T,
-                    mask_id=mask_id,
-                )
+                outs_per_prompt = _collect_samples(prompts, T, N_TOTAL)
             for row, gt, outs in zip(rows, gts, outs_per_prompt):
                 row["temps"][str(T)] = _build_temp_row(T, outs, gt)
         for i, row in zip(idxs, rows):
