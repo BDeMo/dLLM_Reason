@@ -185,15 +185,26 @@ def main():
         prompt, gt = rec["prompt"], rec["ground_truth"]
         row = {"group": group, "idx": idx, "gt": gt, "temps": {}}
         for T in args.temps:
-            # Batched: B=n_samples in ONE forward pass per diffusion step.
-            # On A100-80GB N=8 fits easily for seq_len ≤ 320.
-            outs = generate_batched(
-                model, tok, prompt,
-                n_samples=args.n_samples,
-                gen_length=args.gen_length, steps=args.steps,
-                block_length=args.block_length, temperature=T,
-                mask_id=mask_id,
-            )
+            if T == 0.0:
+                # T=0: deterministic — N samples would be identical.
+                # Run one B=1 generate, replicate result N times for
+                # consistent storage / metric shape.
+                out = generate(model, tok, prompt,
+                               gen_length=args.gen_length, steps=args.steps,
+                               block_length=args.block_length, temperature=0.0,
+                               revise_every=0, mask_id=mask_id)
+                outs = [out] * args.n_samples
+            else:
+                # T>0: B=n_samples batched in ONE forward pass per diffusion
+                # step. Per-row Gumbel makes paths independent. On A100-80GB
+                # N=8 fits easily for seq_len ≤ 320.
+                outs = generate_batched(
+                    model, tok, prompt,
+                    n_samples=args.n_samples,
+                    gen_length=args.gen_length, steps=args.steps,
+                    block_length=args.block_length, temperature=T,
+                    mask_id=mask_id,
+                )
             corrects = [is_correct(o, gt) for o in outs]
             answers  = [extract_answer(o) for o in outs]
             answers  = [None if a is None else float(a) for a in answers]
