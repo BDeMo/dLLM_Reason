@@ -235,7 +235,11 @@ def generate_batched_multi(model, tokenizer, prompts: list[str], *,
                            n_samples: int,
                            gen_length=128, steps=128, block_length=32,
                            temperature=0.0, mask_id=None,
-                           pad_token_id: int | None = None) -> list[list[str]]:
+                           pad_token_id: int | None = None,
+                           _attn_mask_supported: bool | None = None) -> list[list[str]]:
+    """If _attn_mask_supported is None we probe once; pass True/False from
+    caller to skip the probe (e.g. when caller already did its own probe).
+    """
     import torch
     import torch.nn.functional as F
 
@@ -258,6 +262,10 @@ def generate_batched_multi(model, tokenizer, prompts: list[str], *,
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = tokenizer.eos_token_id  # safe fallback
+    # Defensive: pad_token_id MUST differ from mask_id, else pad positions
+    # would be treated as masked positions to unmask.
+    assert pad_token_id != mask_id, \
+        f"pad_token_id ({pad_token_id}) == mask_id ({mask_id}) — would corrupt mask logic"
 
     P = len(prompts)
     N = n_samples
@@ -291,6 +299,18 @@ def generate_batched_multi(model, tokenizer, prompts: list[str], *,
     x = base_x.repeat_interleave(N, dim=0)                  # (B, L)
     attn = attn.repeat_interleave(N, dim=0)                 # (B, L)
 
+    # Probe ONCE whether model.forward accepts attention_mask. The hot
+    # loop below does ~128 forward passes; per-step try/except adds noise
+    # to the log AND prevents JIT inlining.
+    if _attn_mask_supported is None:
+        try:
+            with torch.no_grad():
+                _probe = model(x[:1], attention_mask=attn[:1]).logits
+            del _probe
+            _attn_mask_supported = True
+        except TypeError:
+            _attn_mask_supported = False
+
     with torch.no_grad():
         for block_idx in range(num_blocks):
             b_start = max_prompt_len + block_idx * block_length
@@ -303,12 +323,9 @@ def generate_batched_multi(model, tokenizer, prompts: list[str], *,
 
             for step in range(steps_per_block):
                 mask_index = (x == mask_id)                 # (B, L)
-                # Forward with attention_mask. LLaDA accepts (input_ids,
-                # attention_mask) per its modeling_llada signature.
-                try:
+                if _attn_mask_supported:
                     logits = model(x, attention_mask=attn).logits
-                except TypeError:
-                    # fallback if model.forward doesn't accept attention_mask
+                else:
                     logits = model(x).logits
                 x0 = _add_gumbel(logits, temperature).argmax(dim=-1)
                 p = F.softmax(logits, dim=-1)  # bf16 (topk ordering doesn't need fp64; saves 8× memory)

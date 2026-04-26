@@ -229,13 +229,13 @@ def main():
                 with torch.no_grad():
                     if attn_kw_ok:
                         try:
-                            _ = model(x, attention_mask=attn).logits
+                            out = model(x, attention_mask=attn).logits
                         except TypeError:
                             attn_kw_ok = False
-                            _ = model(x).logits
+                            out = model(x).logits
                     else:
-                        _ = model(x).logits
-                del x, attn
+                        out = model(x).logits
+                del x, attn, out
                 torch.cuda.empty_cache()
                 print(f"[H3] autotune: ✓ P={P}, N_inner={N_in} (B={B}) fits")
                 return P, N_in
@@ -254,6 +254,45 @@ def main():
         N_INNER = N_TOTAL
     print(f"[H3] using P_BATCH={P_BATCH}, N_INNER={N_INNER}, "
           f"N_TOTAL={N_TOTAL}, B={P_BATCH*N_INNER}")
+
+    # Probe attention_mask support once for the hot loop in
+    # generate_batched_multi (avoids per-step try/except overhead).
+    print("[H3] probing model.forward(attention_mask=...) ...")
+    try:
+        with torch.no_grad():
+            _probe_x = torch.full((1, 16), mask_id, dtype=torch.long, device="cuda")
+            _probe_a = torch.ones((1, 16), dtype=torch.long, device="cuda")
+            _ = model(_probe_x, attention_mask=_probe_a).logits
+            del _probe_x, _probe_a, _
+        ATTN_MASK_OK = True
+        print("[H3]   attention_mask supported ✓")
+    except TypeError:
+        ATTN_MASK_OK = False
+        print("[H3]   attention_mask NOT supported — falling back to model(x)")
+    torch.cuda.empty_cache()
+
+    # Pre-tokenize all prompts to find their length, then sort each todo
+    # list by length DESCENDING so each chunk has prompts of similar
+    # length (minimizing pad → minimizing position-id shift for shorter
+    # prompts in the chunk → cleaner generation distribution).
+    def _prompt_len(rec):
+        msgs = [{"role": "user", "content": rec["prompt"]}]
+        text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        return len(tok(text)["input_ids"])
+
+    print("[H3] sorting todos by prompt length (reduces in-chunk padding)...")
+    fail_lens = {i: _prompt_len(fail_prompts[i]) for i in fail_todo}
+    ok_lens = {i: _prompt_len(ok_prompts[i]) for i in ok_todo}
+    fail_todo = sorted(fail_todo, key=lambda i: -fail_lens[i])
+    ok_todo = sorted(ok_todo, key=lambda i: -ok_lens[i])
+    if fail_todo:
+        print(f"[H3]   fail lens: max={max(fail_lens.values())} "
+              f"min={min(fail_lens.values())} "
+              f"med={sorted(fail_lens.values())[len(fail_lens)//2]}")
+    if ok_todo:
+        print(f"[H3]   ok lens:   max={max(ok_lens.values())} "
+              f"min={min(ok_lens.values())} "
+              f"med={sorted(ok_lens.values())[len(ok_lens)//2]}")
 
     def _build_temp_row(T, outs, gt):
         """Compute correct/answer lists + pass@k metrics for one (T, prompt) cell."""
@@ -287,6 +326,7 @@ def main():
                     gen_length=args.gen_length, steps=args.steps,
                     block_length=args.block_length, temperature=T,
                     mask_id=mask_id,
+                    _attn_mask_supported=ATTN_MASK_OK,
                 )
                 for p_idx, group_outs in enumerate(outs):
                     collected[p_idx].extend(group_outs)
@@ -302,6 +342,7 @@ def main():
                     gen_length=args.gen_length, steps=args.steps,
                     block_length=args.block_length, temperature=0.0,
                     mask_id=mask_id,
+                    _attn_mask_supported=ATTN_MASK_OK,
                 )
                 outs_per_prompt = [grp * N_TOTAL for grp in outs_per_prompt]
             else:
