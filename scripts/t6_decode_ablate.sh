@@ -47,6 +47,7 @@ N_OK=988                     # FULL scope_ok
 EVAL_GPUS=8
 GPU_CSV=""
 AUTO_GPUS=0
+PROMPT_BATCH=8                 # P prompts per forward (B = P × N_samples)
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --eval_gpus)       EVAL_GPUS="$2"; shift 2 ;;
         --gpus)            GPU_CSV="$2"; shift 2 ;;
         --auto_gpus)       AUTO_GPUS=1; shift ;;
+        --prompt_batch)    PROMPT_BATCH="$2"; shift 2 ;;
         --dry_run)         DRY_RUN=1; shift ;;
         -h|--help)         grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "[DEC-ABL] unknown arg: $1" >&2; exit 1 ;;
@@ -145,6 +147,7 @@ for N in "${N_SAMPLES_LIST[@]}"; do
                 --temps "$T" \
                 --n_fail "$N_FAIL" --n_ok "$N_OK" \
                 --prompt_shard "$s/$SHARDS" \
+                --prompt_batch "$PROMPT_BATCH" \
                 --resume \
                 > "$LOG" 2>&1 &
             PIDS+=($!)
