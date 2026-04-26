@@ -218,6 +218,114 @@ def generate_batched(model, tokenizer, prompt, *, n_samples: int,
         return outs
 
 
+# ── Multi-prompt batched (P prompts × N samples in ONE forward) ─────────────
+# Stacks multiple prompts in the batch dim with attention_mask handling
+# variable prompt lengths. Effective B = P × N, which actually saturates
+# A100 SMs (B=8 alone leaves ~70% util on 8B bf16). Returns list[list[str]]
+# shape [P][N].
+def generate_batched_multi(model, tokenizer, prompts: list[str], *,
+                           n_samples: int,
+                           gen_length=128, steps=128, block_length=32,
+                           temperature=0.0, mask_id=None,
+                           pad_token_id: int | None = None) -> list[list[str]]:
+    import torch
+    import torch.nn.functional as F
+
+    def _add_gumbel(logits, t):
+        if t == 0:
+            return logits
+        return logits + t * torch.distributions.Gumbel(0, 1).sample(logits.shape).to(logits.device)
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+    device = next(model.parameters()).device
+    mask_id = mask_id if mask_id is not None else _get_mask_token_id(model, tokenizer)
+    if pad_token_id is None:
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id  # safe fallback
+
+    P = len(prompts)
+    N = n_samples
+    B = P * N
+
+    # Tokenize each prompt with chat template; find max prompt length
+    input_ids_list, real_lens = [], []
+    for p in prompts:
+        msgs = [{"role": "user", "content": p}]
+        text = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        ids = tokenizer(text, return_tensors="pt")["input_ids"][0]
+        input_ids_list.append(ids)
+        real_lens.append(int(ids.shape[0]))
+    max_prompt_len = max(real_lens)
+    L = max_prompt_len + gen_length
+
+    # Build padded input + attention_mask, then replicate ×N for samples.
+    # Layout per prompt-row:  [real_prompt | pad ... pad | mask × gen_length]
+    # attention_mask:         [   1  ...   1  |  0 ... 0 |     1     ... 1  ]
+    base_x = torch.full((P, L), mask_id, dtype=torch.long, device=device)
+    attn   = torch.zeros((P, L), dtype=torch.long, device=device)
+    for i, (ids, rl) in enumerate(zip(input_ids_list, real_lens)):
+        base_x[i, :rl] = ids.to(device)
+        base_x[i, rl:max_prompt_len] = pad_token_id        # pad in [rl, max_prompt_len)
+        # gen region [max_prompt_len, L) stays mask_id
+        attn[i, :rl] = 1                                    # real prompt: visible
+        attn[i, max_prompt_len:] = 1                        # gen region: visible
+        # pad positions [rl, max_prompt_len): attn=0  (model ignores)
+
+    # Replicate each prompt to N rows: x[p*N + s] = base_x[p]
+    x = base_x.repeat_interleave(N, dim=0)                  # (B, L)
+    attn = attn.repeat_interleave(N, dim=0)                 # (B, L)
+
+    with torch.no_grad():
+        for block_idx in range(num_blocks):
+            b_start = max_prompt_len + block_idx * block_length
+            b_end   = max_prompt_len + (block_idx + 1) * block_length
+            block_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+            block_mask[:, b_start:b_end] = True
+
+            n_per_step = block_length // steps_per_block
+            extra = block_length % steps_per_block
+
+            for step in range(steps_per_block):
+                mask_index = (x == mask_id)                 # (B, L)
+                # Forward with attention_mask. LLaDA accepts (input_ids,
+                # attention_mask) per its modeling_llada signature.
+                try:
+                    logits = model(x, attention_mask=attn).logits
+                except TypeError:
+                    # fallback if model.forward doesn't accept attention_mask
+                    logits = model(x).logits
+                x0 = _add_gumbel(logits, temperature).argmax(dim=-1)
+                p = F.softmax(logits.double(), dim=-1)
+                x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1).float()
+                # confine to current block's gen positions
+                x0_p = x0_p.masked_fill(~block_mask, -float("inf"))
+                x0 = torch.where(mask_index, x0, x)
+                conf = torch.where(mask_index, x0_p,
+                                   torch.full_like(x0_p, -float("inf")))
+                n = n_per_step + (1 if step < extra else 0)
+                if n > 0:
+                    _, top_idx = torch.topk(conf, k=n, dim=-1)   # (B, n)
+                    transfer = torch.zeros((B, L), dtype=torch.bool, device=device)
+                    transfer.scatter_(1, top_idx, True)
+                    x = torch.where(transfer, x0, x)
+
+        # Decode each row, group by prompt: outs[p][s]
+        outs: list[list[str]] = []
+        for p_idx in range(P):
+            group = []
+            for s_idx in range(N):
+                row = p_idx * N + s_idx
+                # gen region starts at max_prompt_len for every prompt
+                group.append(tokenizer.decode(x[row, max_prompt_len:],
+                                              skip_special_tokens=True))
+            outs.append(group)
+        return outs
+
+
 # ── 正确性判定 ────────────────────────────────────────────────────────────────
 
 def extract_answer(s: str) -> float | None:

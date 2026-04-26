@@ -124,6 +124,11 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
+    ap.add_argument("--prompt_batch", type=int, default=8,
+                    help="cross-prompt batching: stack P prompts × N samples "
+                         "into one forward (B=P*N). Saturates A100 vs single "
+                         "prompt B=N. Default 8 → B=64 at N=8 fits ≤80GB. "
+                         "Set 1 to disable cross-prompt batching.")
     ap.add_argument("--prompt_shard", default="0/1",
                     help="<idx>/<total> — round-robin partition of (fail+ok) "
                          "prompts across shards. Each shard processes prompts "
@@ -171,7 +176,7 @@ def main():
     # Lazy import
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from h1_remask_rescue import (generate, generate_batched,
+    from h1_remask_rescue import (generate, generate_batched, generate_batched_multi,
                                     _get_mask_token_id, is_correct, extract_answer)
 
     print(f"[H3] loading {args.model} ...")
@@ -181,52 +186,73 @@ def main():
     mask_id = _get_mask_token_id(model, tok)
     print(f"[H3] mask_id = {mask_id}")
 
-    def run_one(group: str, idx: int, rec: dict):
-        prompt, gt = rec["prompt"], rec["ground_truth"]
-        row = {"group": group, "idx": idx, "gt": gt, "temps": {}}
+    P_BATCH = max(1, int(args.prompt_batch))
+
+    def _build_temp_row(T, outs, gt):
+        """Compute correct/answer lists + pass@k metrics for one (T, prompt) cell."""
+        corrects = [is_correct(o, gt) for o in outs]
+        answers  = [extract_answer(o) for o in outs]
+        answers  = [None if a is None else float(a) for a in answers]
+        n_s = args.n_samples
+        return {"correct_list": [bool(c) for c in corrects],
+                "answer_list": answers,
+                "pass@1": pass_at_k(corrects, 1),
+                "pass@4": pass_at_k(corrects, min(4, n_s)),
+                "pass@8": pass_at_k(corrects, n_s)}
+
+    def run_batch(group: str, idxs: list[int], recs: list[dict]):
+        """Process P prompts together (B = P × N) in each diffusion forward.
+        For T=0 we still go single-prompt batched path (P=batch but N=1
+        replicated); generate_batched_multi handles N=1 fine but the cheaper
+        path is a per-prompt B=1 generate() loop. Done as fallback."""
+        prompts = [r["prompt"] for r in recs]
+        gts     = [r["ground_truth"] for r in recs]
+        rows = [{"group": group, "idx": i, "gt": g, "temps": {}}
+                for i, g in zip(idxs, gts)]
+
         for T in args.temps:
             if T == 0.0:
-                # T=0: deterministic — N samples would be identical.
-                # Run one B=1 generate, replicate result N times for
-                # consistent storage / metric shape.
-                out = generate(model, tok, prompt,
-                               gen_length=args.gen_length, steps=args.steps,
-                               block_length=args.block_length, temperature=0.0,
-                               revise_every=0, mask_id=mask_id)
-                outs = [out] * args.n_samples
+                # Deterministic: 1 sample per prompt suffices. We can still
+                # cross-prompt-batch with N=1 to keep GPU saturated.
+                outs_per_prompt = generate_batched_multi(
+                    model, tok, prompts,
+                    n_samples=1,
+                    gen_length=args.gen_length, steps=args.steps,
+                    block_length=args.block_length, temperature=0.0,
+                    mask_id=mask_id,
+                )
+                # Replicate the single sample N times for metric uniformity
+                outs_per_prompt = [grp * args.n_samples for grp in outs_per_prompt]
             else:
-                # T>0: B=n_samples batched in ONE forward pass per diffusion
-                # step. Per-row Gumbel makes paths independent. On A100-80GB
-                # N=8 fits easily for seq_len ≤ 320.
-                outs = generate_batched(
-                    model, tok, prompt,
+                outs_per_prompt = generate_batched_multi(
+                    model, tok, prompts,
                     n_samples=args.n_samples,
                     gen_length=args.gen_length, steps=args.steps,
                     block_length=args.block_length, temperature=T,
                     mask_id=mask_id,
                 )
-            corrects = [is_correct(o, gt) for o in outs]
-            answers  = [extract_answer(o) for o in outs]
-            answers  = [None if a is None else float(a) for a in answers]
-            p1 = pass_at_k(corrects, 1)
-            p4 = pass_at_k(corrects, min(4, args.n_samples))
-            p8 = pass_at_k(corrects, args.n_samples)
-            row["temps"][str(T)] = {"correct_list": [bool(c) for c in corrects],
-                                    "answer_list": answers,
-                                    "pass@1": p1, "pass@4": p4, "pass@8": p8}
-        rd.save_prompt_group(group, idx, row)
-        return row
+            for row, gt, outs in zip(rows, gts, outs_per_prompt):
+                row["temps"][str(T)] = _build_temp_row(T, outs, gt)
+        for i, row in zip(idxs, rows):
+            rd.save_prompt_group(group, i, row)
+        return rows
+
+    def chunked(lst, k):
+        for i in range(0, len(lst), k):
+            yield lst[i:i+k]
 
     total = len(fail_todo) + len(ok_todo)
     pp = ProgressPrinter(total, tag="H3 ")
-    for i in fail_todo:
-        row = run_one("fail", i, fail_prompts[i])
-        p8s = [row["temps"][str(T)]["pass@8"] for T in args.temps]
-        pp.tick(f"FAIL[{i}] p@8={'/'.join(f'{x:.0f}' for x in p8s)}")
-    for i in ok_todo:
-        row = run_one("ok", i, ok_prompts[i])
-        p8s = [row["temps"][str(T)]["pass@8"] for T in args.temps]
-        pp.tick(f"OK  [{i}] p@8={'/'.join(f'{x:.0f}' for x in p8s)}")
+    for chunk in chunked(fail_todo, P_BATCH):
+        rows = run_batch("fail", chunk, [fail_prompts[i] for i in chunk])
+        for i, row in zip(chunk, rows):
+            p8s = [row["temps"][str(T)]["pass@8"] for T in args.temps]
+            pp.tick(f"FAIL[{i}] p@8={'/'.join(f'{x:.0f}' for x in p8s)}")
+    for chunk in chunked(ok_todo, P_BATCH):
+        rows = run_batch("ok", chunk, [ok_prompts[i] for i in chunk])
+        for i, row in zip(chunk, rows):
+            p8s = [row["temps"][str(T)]["pass@8"] for T in args.temps]
+            pp.tick(f"OK  [{i}] p@8={'/'.join(f'{x:.0f}' for x in p8s)}")
 
     # Aggregate
     fail_recs = [json.loads(p.read_text(encoding="utf-8"))
