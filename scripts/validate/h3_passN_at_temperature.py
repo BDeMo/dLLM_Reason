@@ -124,8 +124,21 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
+    ap.add_argument("--prompt_shard", default="0/1",
+                    help="<idx>/<total> — round-robin partition of (fail+ok) "
+                         "prompts across shards. Each shard processes prompts "
+                         "where i %% total == idx. Outputs share the same "
+                         "run_dir; per_prompt/<group>_<idx>.json is keyed by "
+                         "global idx so shards never collide. Used by "
+                         "t6_decode_ablate to spread one (T, N) cell across "
+                         "multiple GPUs.")
     add_common_args(ap)
     args = ap.parse_args()
+    try:
+        SHARD_IDX, SHARD_TOTAL = (int(x) for x in args.prompt_shard.split("/"))
+        assert 0 <= SHARD_IDX < SHARD_TOTAL
+    except Exception:
+        raise SystemExit(f"--prompt_shard must be 'idx/total', got {args.prompt_shard!r}")
 
     assert SCOPE.exists(), f"先跑 h0_forensics.py 生成 {SCOPE}"
     assert SCOPE_OK.exists(), f"先跑 h0_forensics.py 生成 {SCOPE_OK}（H3 需要 init_ok 对照组）"
@@ -138,9 +151,14 @@ def main():
     rd = H3RunDir(run_dir, "H3", config=vars(args), resume=args.resume)
     print(f"[H3] run_dir = {rd.dir}")
 
-    fail_todo = [i for i in range(len(fail_prompts)) if not rd.has_prompt_group("fail", i)]
-    ok_todo = [i for i in range(len(ok_prompts)) if not rd.has_prompt_group("ok", i)]
-    print(f"[H3] fail_todo={len(fail_todo)}  ok_todo={len(ok_todo)}")
+    fail_todo = [i for i in range(len(fail_prompts))
+                 if not rd.has_prompt_group("fail", i)
+                 and i % SHARD_TOTAL == SHARD_IDX]
+    ok_todo = [i for i in range(len(ok_prompts))
+               if not rd.has_prompt_group("ok", i)
+               and i % SHARD_TOTAL == SHARD_IDX]
+    print(f"[H3] shard {SHARD_IDX}/{SHARD_TOTAL}: "
+          f"fail_todo={len(fail_todo)}  ok_todo={len(ok_todo)}")
 
     if args.dry_run:
         per_prompt = len(args.temps) * args.n_samples

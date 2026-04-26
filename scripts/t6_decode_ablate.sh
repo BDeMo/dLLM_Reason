@@ -88,23 +88,11 @@ echo "[DEC-ABL]   temps       = ${TEMPS[*]}"
 echo "[DEC-ABL]   n_samples   = ${N_SAMPLES_LIST[*]}"
 echo "[DEC-ABL]   n_fail/ok   = $N_FAIL / $N_OK  (full=331/988)"
 echo "[DEC-ABL]   gen/bl/steps= $GEN_LENGTH / $BLOCK_LENGTH / $STEPS_"
-# Cap parallelism to actual cell count — no point reserving 8 GPUs for
-# 3 cells (wastes auto_gpus picks that other work could use).
+# Resolve GPU indices first (no cap — we shard each (T,N) cell across
+# multiple GPUs so we use all EVAL_GPUS regardless of N_CELLS).
 N_CELLS=$(( ${#TEMPS[@]} * ${#N_SAMPLES_LIST[@]} ))
-if [[ "$EVAL_GPUS" -gt "$N_CELLS" ]]; then
-    echo "[DEC-ABL]   cap EVAL_GPUS $EVAL_GPUS → $N_CELLS (n_cells = $N_CELLS)"
-    EVAL_GPUS=$N_CELLS
-fi
-echo "[DEC-ABL]   eval_gpus   = $EVAL_GPUS  (for $N_CELLS cells)"
-
-# Resolve GPU indices
 if [[ -n "$GPU_CSV" ]]; then
     IFS=',' read -r -a GPUS_ARR <<< "$GPU_CSV"
-    # explicit list — user chose; don't cap beyond cell count but warn
-    if [[ "${#GPUS_ARR[@]}" -gt "$N_CELLS" ]]; then
-        GPUS_ARR=("${GPUS_ARR[@]:0:$N_CELLS}")
-        echo "[DEC-ABL]   trimmed --gpus to first $N_CELLS (matches cells)"
-    fi
     EVAL_GPUS="${#GPUS_ARR[@]}"
 elif [[ "$AUTO_GPUS" -eq 1 ]]; then
     source "$SCRIPT_DIR/_select_gpus.sh"
@@ -115,44 +103,59 @@ else
     GPUS_ARR=(); for i in $(seq 0 $((EVAL_GPUS - 1))); do GPUS_ARR+=("$i"); done
 fi
 
+# Distribute EVAL_GPUS across N_CELLS as evenly as possible (round-robin).
+# Each cell gets either floor(G/C) or ceil(G/C) GPUs as prompt-shards.
+# Within a cell, prompts are split round-robin across shards via
+# --prompt_shard <idx>/<total>; per_prompt files key on global prompt
+# idx so shards never collide and aggregator sees full results.
+SHARDS_BASE=$(( EVAL_GPUS / N_CELLS ))
+SHARDS_EXTRA=$(( EVAL_GPUS % N_CELLS ))
+echo "[DEC-ABL]   eval_gpus   = $EVAL_GPUS  (sharding ${N_CELLS} cells)"
+echo "[DEC-ABL]   shards/cell = $SHARDS_BASE base, +1 for first $SHARDS_EXTRA cells"
 echo "[DEC-ABL]   out base    = $OUT_BASE"
 echo "[DEC-ABL] ============================================================"
 
-# ── launch one (T, N) cell per GPU, throttle at EVAL_GPUS ───────────────
-declare -a PIDS=()
-declare -a PID_LABELS=()
+# ── launch (T, N) × shard, one process per GPU ───────────────────────────
+declare -a PIDS=() PID_LABELS=()
 g=0
+cell_idx=0
 for N in "${N_SAMPLES_LIST[@]}"; do
     for T in "${TEMPS[@]}"; do
         CELL="T${T}_N${N}"
         RUN_DIR="$OUT_BASE/${CELL}_${TS}"
-        LOG="$LOG_DIR/dec_ablate_${CKPT_LABEL}_${CELL}_${TS}.log"
 
-        GPU="${GPUS_ARR[$g]}"
-        echo "[DEC-ABL]   launch T=$T N=$N on GPU $GPU (slot $g) → $RUN_DIR"
-        [[ "$DRY_RUN" -eq 1 ]] && continue
+        SHARDS=$SHARDS_BASE
+        [[ "$cell_idx" -lt "$SHARDS_EXTRA" ]] && SHARDS=$((SHARDS + 1))
+        [[ "$SHARDS" -lt 1 ]] && SHARDS=1
 
-        CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 python -u \
-            scripts/validate/h3_passN_at_temperature.py \
-            --model "$CKPT" \
-            --run_dir "$RUN_DIR" \
-            --n_samples "$N" \
-            --gen_length "$GEN_LENGTH" \
-            --block_length "$BLOCK_LENGTH" \
-            --steps "$STEPS_" \
-            --temps "$T" \
-            --n_fail "$N_FAIL" --n_ok "$N_OK" \
-            > "$LOG" 2>&1 &
-        PIDS+=($!)
-        PID_LABELS+=("$CELL")
-        g=$(( (g + 1) % EVAL_GPUS ))
-        if [[ "${#PIDS[@]}" -ge "$EVAL_GPUS" ]]; then
-            wait "${PIDS[0]}" || echo "[DEC-ABL] ✗ ${PID_LABELS[0]} FAILED"
-            PIDS=("${PIDS[@]:1}")
-            PID_LABELS=("${PID_LABELS[@]:1}")
-        fi
+        for ((s=0; s<SHARDS; s++)); do
+            GPU="${GPUS_ARR[$g]}"
+            LOG="$LOG_DIR/dec_ablate_${CKPT_LABEL}_${CELL}_shard${s}of${SHARDS}_${TS}.log"
+            echo "[DEC-ABL]   launch $CELL shard $s/$SHARDS on GPU $GPU → $RUN_DIR"
+            [[ "$DRY_RUN" -eq 1 ]] && { g=$((g+1)); continue; }
+
+            CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 python -u \
+                scripts/validate/h3_passN_at_temperature.py \
+                --model "$CKPT" \
+                --run_dir "$RUN_DIR" \
+                --n_samples "$N" \
+                --gen_length "$GEN_LENGTH" \
+                --block_length "$BLOCK_LENGTH" \
+                --steps "$STEPS_" \
+                --temps "$T" \
+                --n_fail "$N_FAIL" --n_ok "$N_OK" \
+                --prompt_shard "$s/$SHARDS" \
+                --resume \
+                > "$LOG" 2>&1 &
+            PIDS+=($!)
+            PID_LABELS+=("${CELL}_shard${s}")
+            g=$((g + 1))
+        done
+        cell_idx=$((cell_idx + 1))
     done
 done
+echo "[DEC-ABL] dispatched ${#PIDS[@]} shards on $EVAL_GPUS GPUs"
+# Wait all (no throttle — we already dispatch == EVAL_GPUS shards)
 for i in "${!PIDS[@]}"; do
     wait "${PIDS[$i]}" || echo "[DEC-ABL] ✗ ${PID_LABELS[$i]} FAILED"
 done
