@@ -171,7 +171,8 @@ def main():
     # Lazy import
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from h1_remask_rescue import generate, _get_mask_token_id, is_correct, extract_answer
+    from h1_remask_rescue import (generate, generate_batched,
+                                    _get_mask_token_id, is_correct, extract_answer)
 
     print(f"[H3] loading {args.model} ...")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -184,18 +185,18 @@ def main():
         prompt, gt = rec["prompt"], rec["ground_truth"]
         row = {"group": group, "idx": idx, "gt": gt, "temps": {}}
         for T in args.temps:
-            corrects, answers = [], []
-            for _ in range(args.n_samples):
-                out = generate(model, tok, prompt,
-                               gen_length=args.gen_length, steps=args.steps,
-                               block_length=args.block_length, temperature=T,
-                               revise_every=0, mask_id=mask_id)
-                corrects.append(is_correct(out, gt))
-                # Persist extracted numeric answer per sample so SC / BoN
-                # post-processors can compute mode / rank without re-running
-                # inference. None = no number parsed.
-                a = extract_answer(out)
-                answers.append(None if a is None else float(a))
+            # Batched: B=n_samples in ONE forward pass per diffusion step.
+            # On A100-80GB N=8 fits easily for seq_len ≤ 320.
+            outs = generate_batched(
+                model, tok, prompt,
+                n_samples=args.n_samples,
+                gen_length=args.gen_length, steps=args.steps,
+                block_length=args.block_length, temperature=T,
+                mask_id=mask_id,
+            )
+            corrects = [is_correct(o, gt) for o in outs]
+            answers  = [extract_answer(o) for o in outs]
+            answers  = [None if a is None else float(a) for a in answers]
             p1 = pass_at_k(corrects, 1)
             p4 = pass_at_k(corrects, min(4, args.n_samples))
             p8 = pass_at_k(corrects, args.n_samples)

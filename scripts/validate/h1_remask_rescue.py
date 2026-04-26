@@ -149,6 +149,75 @@ def generate(model, tokenizer, prompt, gen_length=128, steps=128, block_length=3
         return tokenizer.decode(x[0, prompt_len:], skip_special_tokens=True)
 
 
+# ── Batched N-sample variant (8B bf16 underutilizes 1 sample on A100) ───────
+# Same algorithm as generate() above, but B=N independent samples for one
+# prompt. All N rows share the prompt; per-row Gumbel + per-row topk make
+# each row a distinct sample path. Returns list[str] of N decoded outputs.
+#
+# Expected speedup vs N serial generate() calls: 5-8× on A100-80GB at N=8
+# (limited by memory + matmul scaling). For N=16 may need to stage in
+# halves if seq_len > 320.
+def generate_batched(model, tokenizer, prompt, *, n_samples: int,
+                     gen_length=128, steps=128, block_length=32,
+                     temperature=0.0, mask_id=None) -> list[str]:
+    import torch
+    import torch.nn.functional as F
+
+    def _add_gumbel(logits, t):
+        if t == 0:
+            return logits
+        return logits + t * torch.distributions.Gumbel(0, 1).sample(logits.shape).to(logits.device)
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+    device = next(model.parameters()).device
+    mask_id = mask_id if mask_id is not None else _get_mask_token_id(model, tokenizer)
+    B = n_samples
+
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    input_ids = tokenizer(text, return_tensors="pt")["input_ids"].to(device)
+    prompt_len = input_ids.shape[1]
+    L = prompt_len + gen_length
+
+    with torch.no_grad():
+        x = torch.full((B, L), mask_id, dtype=torch.long, device=device)
+        x[:, :prompt_len] = input_ids                          # broadcast same prompt to all B
+
+        for block_idx in range(num_blocks):
+            b_start = prompt_len + block_idx * block_length
+            b_end = prompt_len + (block_idx + 1) * block_length
+            block_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+            block_mask[:, b_start:b_end] = True
+            # All rows have same masked count in this block (same prompt)
+            n_per_step = block_length // steps_per_block
+            extra = block_length % steps_per_block
+
+            for step in range(steps_per_block):
+                mask_index = (x == mask_id)                    # (B, L)
+                logits = model(x).logits                       # (B, L, V) — the bottleneck step
+                x0 = _add_gumbel(logits, temperature).argmax(dim=-1)  # (B, L)
+                p = F.softmax(logits.double(), dim=-1)
+                x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1).float()
+                x0_p = x0_p.masked_fill(~block_mask, -float("inf"))
+                x0 = torch.where(mask_index, x0, x)
+                conf = torch.where(mask_index, x0_p,
+                                   torch.full_like(x0_p, -float("inf")))
+                # Per-row topk: each sample diverges based on its own Gumbel
+                n = n_per_step + (1 if step < extra else 0)
+                if n > 0:
+                    _, top_idx = torch.topk(conf, k=n, dim=-1)  # (B, n)
+                    transfer = torch.zeros((B, L), dtype=torch.bool, device=device)
+                    transfer.scatter_(1, top_idx, True)
+                    x = torch.where(transfer, x0, x)
+
+        outs = [tokenizer.decode(x[i, prompt_len:], skip_special_tokens=True)
+                for i in range(B)]
+        return outs
+
+
 # ── 正确性判定 ────────────────────────────────────────────────────────────────
 
 def extract_answer(s: str) -> float | None:
