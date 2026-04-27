@@ -26,6 +26,7 @@ Thumbs.db
 # Project artifacts
 results/
 figures/
+!docs/figures/
 runs/
 *.db
 *.faiss

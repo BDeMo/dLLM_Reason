@@ -27,6 +27,12 @@
 
 ---
 
+![Capacity ladder](../figures/capacity_ladder.png)
+
+> **图 0**：每条 ceiling 当前的实测 / 估算 rescue 率。greedy 28% → SC 38% → oracle pass@N 66% → A 轴 union 91% → A+T6+? 待解锁。注意 60-scope 与 331-scope 不同口径，取趋势看。
+
+---
+
 ## 1. Stage 1：A 轴探索 —— 不动模型，只动推理
 
 **问题**：base LLaDA 在 fail 集上 0%，纯推理超参/方法能救多少？
@@ -47,6 +53,14 @@
 - 旧 H2 假设 "block-level order 信号弱于 content"（variance ratio 应 < 0.3）—— 实际 ratio 0.754，**REJECTED**。意味着 block-level order 已经带 75% 的输出方差，A1 的 edge-level revise 是错的粒度。
 - A 轴所有方法 **union** 救回 55/60 = 91.67%。
 - 剩下 **5 条永远救不回**：`Ceiling-5 = {4, 5, 14, 41, 42}` —— A 轴的 capacity ceiling。
+
+![A-axis methods](../figures/a_axis_methods.png)
+
+> **图 1**：A 轴各方法的 rescue rate（60-prompt scope）。粒度由细到粗：单 token / span / block / template / gen-length / pass@N。
+> **DEAD（红）**：edge 和 token 粒度全 0。
+> **SUPPORTED（橙）**：block 粒度起开始有信号（A4=8.33%, A5=13.33%, A6=20%）。
+> **Pass@N**（绿）：T>0 采样能救 86.67%，但需要 oracle 挑对的样本。
+> **All-A union（深绿）**：91.67%，剩 5 条 = Ceiling-5 永远救不回。
 
 **结论**：纯推理时干预**有上限**（91.67% on 60-scope, ~5 条 hardcoded ceiling）。pass@N 是单维度最强 lever。但 **pass@N 需要 oracle picker**（看 GT 挑对的样本），不是 deployable。
 
@@ -97,11 +111,23 @@ A 轴说"推理时能救 91% 但需要 oracle"。两条延伸：
 - Full-SFT：fail 大幅救回（+93），但 ok 大幅丢（-83）。"重模型改造"
 - LoRA：fail 适度救（+35），ok 几乎不丢。"轻插件"
 
+![T6 Pareto](../figures/t6_pareto.png)
+
+> **图 2**：T6 24 个 ckpt 的 Pareto 散点（331-scope）。
+> 红方块 = Full-SFT 4 ep 点（28% fail / 91% ok 范围）。
+> 圆点 = LoRA r ∈ {1,2,4,8,16}，颜色按 rank 区分，6-12% fail / 95-98% ok 范围。
+> 绿区 = ok ≥ 95% 的"安全"区，LoRA 都在里面，Full-SFT 都不在。
+> 任何点都没碰到 (100, 100) —— 训练侧 capacity 有上限。
+
 **关键观察 2：T6 hardset = 166/331（50%）**
 
 - 24 个 ckpt **没有任何一个**能救的 fail prompt = 166 条
 - 即"oracle ensemble" 24 ckpt × T=0 pass@1 上限就是 49.8%
 - 训练超参的边际收益已**枯竭**：再加 epoch / 加 rank 也救不回这 166 条
+
+![T6 hardset histogram](../figures/t6_hardset_histogram.png)
+
+> **图 3**：每条 fail prompt 被多少 ckpt 救过的分布。**红色 bar = 166 条 hardset（被 0 个 ckpt 救过）**，与所有其他 bar 加起来等量。橘色（被 1-2 个救）的 35+31 条是 "脆弱 rescue"，绿色长尾（被 ≥7 个救）48 条是"稳健 rescue"。形态是双峰：要么没人救得回，要么大家都救得回。
 
 **关键观察 3：A-axis Ceiling-5 ∩ T6 hardset = ∅**
 
@@ -111,6 +137,10 @@ A 轴说"推理时能救 91% 但需要 oracle"。两条延伸：
 - 24 ckpt union 覆盖 5/5
 
 **含义**：**A 轴 ceiling 与 T6 ceiling 正交**。A 轴推理时救不回的 5 条，训练能救；T6 训练救不回的 166 条，可能推理时能救。**两轴联合潜力远高于单轴**。
+
+![Cross-axis Venn](../figures/cross_axis_venn.png)
+
+> **图 4**：A 轴 Ceiling-5（5 条 inference 救不回）与 T6 hardset（166 条训练救不回）**完全不相交**。这是项目最重要的实证：单轴 ceiling 不是 capacity ceiling。两轴方法各自的失败模式是正交的，组合（training + decoding）必能突破任一单轴。
 
 ---
 
@@ -154,6 +184,10 @@ SC@8       T=0.7 (Full-SFT step_336):   fail 38.4%, ok 94.7%
 ```
 
 SC 单独能 deploy，**但远没到 65% capacity 上限**。剩 ~28% rescue 是 oracle 才拿得到的。
+
+![pass@N vs SC@N](../figures/passN_vs_SC.png)
+
+> **图 5**：3 ckpt × 3 温度 × pass@8 vs SC@8 对照。蓝条 = oracle pass@8（capacity 上限），红条 = SC@8（majority vote，可部署）。中间灰色箭头标注 gap。**所有 cell gap 都在 22-30%**，远超行业典型 10-15%。这意味着模型在 fail prompts 上**没收敛到正解**：8 个 sample 里偶尔产 1-2 个对的，剩 6-7 个有系统性偏好的错答案，majority 投错的。
 
 **关键观察 7：T 越高 pass@N 越高，但 SC 不一定**
 
@@ -259,7 +293,20 @@ oracle (T6 best @ T=1.0 pass@8):     65.9% fail, 98.7% ok    ← 不可部署
 
 ---
 
-## 8. 文件 / 数据导引
+## 8. 图表索引
+
+所有图均由 `scripts/make_logic_chain_figures.py` 生成（idempotent，新数据落盘后重跑即可刷新）。
+
+| 编号 | 文件 | 内容 |
+|---|---|---|
+| 0 | `docs/figures/capacity_ladder.png` | 能力天花板梯度图（baseline → SC → pass@N → A 轴 union） |
+| 1 | `docs/figures/a_axis_methods.png` | A 轴 6 方法 + union rescue rate bar chart（60-scope） |
+| 2 | `docs/figures/t6_pareto.png` | T6 24 ckpt Pareto 散点（fail vs ok, 331-scope） |
+| 3 | `docs/figures/t6_hardset_histogram.png` | rescue-count 分布直方（166 hardset 双峰）|
+| 4 | `docs/figures/cross_axis_venn.png` | Ceiling-5 ∩ T6_hardset = ∅ Venn |
+| 5 | `docs/figures/passN_vs_SC.png` | 3 ckpt × 3 T × pass@8 vs SC@8 对照 |
+
+## 9. 文件 / 数据导引
 
 | 概念 | 主文档 | 主数据 |
 |---|---|---|
