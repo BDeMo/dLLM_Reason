@@ -187,15 +187,38 @@ $LAUNCH scripts/validate/t6t7_train.py \
     echo "[T7][C] ERROR: SFT failed — no $T7_DIR/hf"; exit 1; }
 
 # ── Phase D: eval ───────────────────────────────────────────────────────
-echo "[T7][D] canonical eval ..."
+echo "[T7][D] canonical eval (t7 only — baseline+t6 stitched from cache) ..."
 EVAL_OUT="$ROOT/runs/validation/t7_eval_${TS}"
-python scripts/validate/v16_eval.py \
-    --ckpts "baseline=GSAI-ML/LLaDA-8B-Instruct" \
-            "t6=$BASE_CKPT" \
-            "t7=$T7_DIR/hf" \
-    --out_dir "$EVAL_OUT" \
-    --gen_length 128 --block_length 32 --temperature 0 \
-    2>&1 | tee "$LOG_DIR/t7_eval_canonical_${TS}.log"
+
+# Try stitch path: only eval t7, reuse baseline+t6 from a prior compatible
+# comparison.md. If no prior, fall through to full 3-way eval (slower).
+PRIOR_FOUND=0
+if ls -d runs/validation/t7_eval_*/ 2>/dev/null | grep -q .; then
+    PRIOR_FOUND=1
+    echo "[T7][D] prior t7_eval found — eval ONLY t7 then stitch"
+fi
+
+if [[ "$PRIOR_FOUND" -eq 1 ]]; then
+    python scripts/validate/v16_eval.py \
+        --ckpts "t7=$T7_DIR/hf" \
+        --out_dir "$EVAL_OUT" \
+        --gen_length 128 --block_length 32 --temperature 0 \
+        2>&1 | tee "$LOG_DIR/t7_eval_canonical_${TS}.log"
+
+    python scripts/t7_stitch_comparison.py \
+        --new_eval "$EVAL_OUT" \
+        --base_ckpt "$BASE_CKPT" \
+        2>&1 | tee -a "$LOG_DIR/t7_eval_canonical_${TS}.log"
+else
+    echo "[T7][D] no prior cache — running full 3-way eval (~10 min)"
+    python scripts/validate/v16_eval.py \
+        --ckpts "baseline=GSAI-ML/LLaDA-8B-Instruct" \
+                "t6=$BASE_CKPT" \
+                "t7=$T7_DIR/hf" \
+        --out_dir "$EVAL_OUT" \
+        --gen_length 128 --block_length 32 --temperature 0 \
+        2>&1 | tee "$LOG_DIR/t7_eval_canonical_${TS}.log"
+fi
 
 cat "$EVAL_OUT/comparison.md"
 
