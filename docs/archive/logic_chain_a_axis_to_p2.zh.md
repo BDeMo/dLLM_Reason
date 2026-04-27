@@ -1,6 +1,6 @@
 # 逻辑链：A 轴 → T6 → P2 Decode Frontier
 
-> 语言：中文 | English: TODO
+> 语言：中文 | English: [logic_chain_a_axis_to_p2.md](logic_chain_a_axis_to_p2.md)
 
 **目的**：把项目从 A 轴 fail-rescue 实验起一直到当前 P2 decode_ablate 的完整推理链整理成一篇文档，方便后续 T7 / Verifier / RL 的决策有清晰锚点。
 
