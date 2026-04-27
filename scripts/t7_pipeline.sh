@@ -20,17 +20,21 @@
 
 set -euo pipefail
 
-BASE_CKPT="runs/training/v161_t6_ablate/hf_step_336"   # default warm-start
+BASE_CKPT="runs/training/v161_t6_ablate/hf_step_336"   # warm-start
+GEN_CKPT=""                                              # gen source (default = BASE_CKPT)
 SCOPE_PATH=""                                            # default: gsm8k train
 N_PROMPTS=0                                              # 0 = all in scope
 TEMPERATURES="0.7,1.0"
 N_SAMPLES=8
 GEN_LENGTH=192
 BLOCK_LENGTH=32
-PICK="shortest"
+PICK="first"                                             # 'first' avoids short-truncation bias
 SFT_GPUS=8
 EVAL_GPUS=8
-T7_MAX_STEPS=1500
+# 2 epochs default (sweet spot from T6 ablate). 1 epoch = train_size/8 steps
+# (bs=1 × accum=16 × world=8 → backward every 8 samples). For 1918 samples
+# that's ~240 steps/epoch → 480 steps for 2 epochs.
+T7_MAX_STEPS=480
 T7_LR=2e-5
 GEN_GPUS=8
 SKIP_GEN=0
@@ -39,6 +43,7 @@ JSONL_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base_ckpt)    BASE_CKPT="$2"; shift 2 ;;
+        --gen_ckpt)     GEN_CKPT="$2"; shift 2 ;;
         --scope_path)   SCOPE_PATH="$2"; shift 2 ;;
         --n_prompts)    N_PROMPTS="$2"; shift 2 ;;
         --temperatures) TEMPERATURES="$2"; shift 2 ;;
@@ -56,6 +61,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "[T7] unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+# gen_ckpt defaults to base_ckpt (self-distill); set differently to use
+# another model as the sample source (e.g. base LLaDA, LoRA, larger model).
+[[ -z "$GEN_CKPT" ]] && GEN_CKPT="$BASE_CKPT"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -75,7 +84,8 @@ LOG_DIR="$ROOT/runs/t7_logs"
 mkdir -p "$LOG_DIR"
 
 echo "[T7] ============================================================"
-echo "[T7]   base_ckpt    = $BASE_CKPT"
+echo "[T7]   base_ckpt    = $BASE_CKPT  (warm-start for SFT)"
+echo "[T7]   gen_ckpt     = $GEN_CKPT   (sample source)"
 echo "[T7]   scope        = $SCOPE_PATH"
 echo "[T7]   n_prompts    = $N_PROMPTS  (0 = all)"
 echo "[T7]   temperatures = $TEMPERATURES"
@@ -96,7 +106,7 @@ if [[ "$SKIP_GEN" -eq 0 ]]; then
         LOG="$LOG_DIR/t7_gen_shard${s}_${TS}.log"
         CUDA_VISIBLE_DEVICES=$s PYTHONUNBUFFERED=1 python -u \
             scripts/validate/t7_gen_correct_samples.py \
-            --model "$BASE_CKPT" \
+            --model "$GEN_CKPT" \
             --scope_path "$SCOPE_PATH" \
             --scope_group gsm8k_train \
             --n "$N_PROMPTS" \
