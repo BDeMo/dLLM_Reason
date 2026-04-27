@@ -78,7 +78,7 @@ def fig_t6_pareto():
 
     ax.set_xlabel("ok retention (%)")
     ax.set_ylabel("fail rescue (%)")
-    ax.set_title("T6 ablation Pareto — fail rescue vs ok retention\n(point size ∝ epoch)")
+    ax.set_title("Trade-off landscape — 24 trained checkpoints\n(point size ∝ training epochs)")
     ax.set_xlim(85, 101); ax.set_ylim(-2, 35)
     ax.grid(alpha=0.3)
     ax.legend(loc="upper left", fontsize=9, framealpha=0.95)
@@ -112,8 +112,8 @@ def fig_a_axis_bars():
     ax.set_xticks(xs)
     ax.set_xticklabels([m[0] for m in methods], fontsize=9)
     ax.set_ylabel("rescue rate on 60-prompt fail scope (%)")
-    ax.set_title("Stage 1 (A axis): inference-only rescue methods\n"
-                 "fine grain (DEAD) → coarse grain (SUPPORTED) → pass@N (oracle ceiling)")
+    ax.set_title("Inference-only rescue methods (no model training)\n"
+                 "fine grain DEAD → coarse grain works → sampling oracle ceiling")
     ax.set_ylim(0, 105)
     ax.axhline(91.67, color="darkgreen", linestyle="--", alpha=0.5, linewidth=1)
     ax.text(0, 93, "union ceiling 91.67%  (Ceiling-5 = 5 prompts unsalvageable)",
@@ -153,10 +153,10 @@ def fig_hardset_histogram():
     ax.text(0, full[0] + 4, f"hardset\n{full[0]} prompts", ha="center",
             fontsize=10, color="red", fontweight="bold")
     ax.set_xticks(xs)
-    ax.set_xlabel("# of 24 T6 ckpts that rescue this prompt")
-    ax.set_ylabel("# of fail prompts")
-    ax.set_title("Stage 2 (T6): per-prompt rescue coverage across 24 ckpts\n"
-                 f"hardset = 166/331 prompts rescued by 0 ckpts (T=0 pass@1 ceiling = 49.8%)")
+    ax.set_xlabel("# of trained checkpoints that rescue this prompt")
+    ax.set_ylabel("# of failing prompts")
+    ax.set_title("Per-prompt rescue coverage across 24 checkpoints\n"
+                 f"hardset = 166/331 prompts no checkpoint rescues (greedy ceiling = 49.8%)")
     ax.grid(axis="y", alpha=0.3)
     out = FIG_DIR / "t6_hardset_histogram.png"
     plt.savefig(out); plt.close()
@@ -205,30 +205,45 @@ def fig_passN_vs_sc():
     if not cells:
         print("  (skip — no parsed cells)"); return
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 5.5))
     n = len(cells)
     xs = np.arange(n)
     pass8 = [c[2] for c in cells]
     sc8 = [c[3] for c in cells]
-    w = 0.4
+    w = 0.38
     ax.bar(xs - w/2, pass8, w, color="steelblue", edgecolor="black",
-           label="pass@8 (oracle)")
+           label="Sampling oracle (pass@8)")
     ax.bar(xs + w/2, sc8, w, color="indianred", edgecolor="black",
-           label="SC@8 (deployable)")
-    # gap arrows
+           label="Majority vote (SC@8)")
+
+    # gap arrows + label OFFSET to the RIGHT of the right bar so it's
+    # not hidden behind the red bar
+    LABEL_X_OFFSET = 0.32
     for i, (p, s) in enumerate(zip(pass8, sc8)):
-        ax.annotate("", xy=(i, p), xytext=(i, s),
-                    arrowprops=dict(arrowstyle="->", color="gray", alpha=0.6))
-        ax.text(i, (p+s)/2, f"−{p-s:.1f}", ha="center",
-                fontsize=8, color="gray")
+        # vertical line connecting top of red bar to top of blue bar
+        ax.annotate("",
+                    xy=(i, p - 0.5),
+                    xytext=(i, s + 0.5),
+                    arrowprops=dict(arrowstyle="<->", color="dimgray",
+                                    alpha=0.85, lw=1.4))
+        # gap value placed to the RIGHT of both bars, vertically centered
+        ax.text(i + LABEL_X_OFFSET + w/2, (p + s) / 2,
+                f"gap\n{p - s:.1f}",
+                ha="left", va="center",
+                fontsize=8.5, color="dimgray", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor="lightgray", alpha=0.85))
+
     ax.set_xticks(xs)
-    ax.set_xticklabels([f"{c[0]}\n@T={c[1]}" for c in cells], fontsize=8)
+    ax.set_xticklabels([f"{c[0]}\n@T={c[1]}" for c in cells], fontsize=9)
     ax.set_ylabel("fail rescue (%)")
-    ax.set_title("Stage 3 (P2): pass@N (oracle) vs SC@N (deployable) on full scope\n"
-                 "gap 25–30% = capacity model has but majority-vote can't tap")
+    ax.set_title("Sampling oracle vs deployable majority-vote on full scope\n"
+                 "gap 25-30% = model capacity exists but cannot be tapped without oracle")
     ax.legend(loc="upper right")
     ax.grid(axis="y", alpha=0.3)
-    ax.set_ylim(0, 75)
+    ax.set_ylim(0, 78)
+    # extra right margin so the rightmost gap label fits
+    ax.set_xlim(-0.6, n - 0.4 + LABEL_X_OFFSET + w/2 + 0.4)
     out = FIG_DIR / "passN_vs_SC.png"
     plt.savefig(out); plt.close()
     print(f"  → {out}")
@@ -238,13 +253,13 @@ def fig_passN_vs_sc():
 def fig_capacity_ladder():
     """Vertical bars showing each level of fail rescue achievable."""
     levels = [
-        ("baseline\n(vanilla T=0)", 0.0, "lightgray"),
-        ("T6 best greedy\n(step_336 T=0)", 28.1, "tab:blue"),
-        ("T6 + SC@8\n(deployable)", 38.4, "tab:cyan"),
-        ("T6 oracle pass@8\n(T=1.0)", 65.9, "tab:purple"),
-        ("24-ckpt union\n(T=0 only)", 49.8, "tab:olive"),
-        ("A-axis union\n(60-scope)", 91.67, "tab:green"),
-        ("???\nA + T6 + ?", 100, "white"),
+        ("Untrained\ngreedy", 0.0, "lightgray"),
+        ("Trained\ngreedy", 28.1, "tab:blue"),
+        ("Sampling\n+ majority vote", 38.4, "tab:cyan"),
+        ("Sampling\n+ oracle", 65.9, "tab:purple"),
+        ("Best-of\ncheckpoints", 49.8, "tab:olive"),
+        ("Inference\ntweaks", 91.67, "tab:green"),
+        ("Combined\npotential", 100, "white"),
     ]
     fig, ax = plt.subplots(figsize=(11, 5))
     xs = np.arange(len(levels))
@@ -280,32 +295,56 @@ def fig_capacity_ladder():
 
 # ──────────────────── Figure 6: Cross-axis Venn diagram ────────────────────
 def fig_cross_axis_venn():
-    """Conceptual: Ceiling-5 (A-axis) ∩ T6_hardset (training) = ∅."""
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    """Conceptual: inference-ceiling and training-ceiling are disjoint."""
+    fig, ax = plt.subplots(figsize=(10, 6))
     from matplotlib.patches import Circle
-    c1 = Circle((-1.5, 0), 1.6, alpha=0.35, color="tab:blue", linewidth=2,
+    # Two non-overlapping circles (positions chosen so they JUST touch)
+    LEFT_CTR = (-1.7, 0); LEFT_R = 1.6
+    RIGHT_CTR = (1.6, 0); RIGHT_R = 2.4
+    c1 = Circle(LEFT_CTR, LEFT_R, alpha=0.35, color="tab:blue", linewidth=2,
                 edgecolor="navy")
-    c2 = Circle((1.5, 0), 2.4, alpha=0.35, color="tab:red", linewidth=2,
+    c2 = Circle(RIGHT_CTR, RIGHT_R, alpha=0.35, color="tab:red", linewidth=2,
                 edgecolor="darkred")
     ax.add_patch(c1); ax.add_patch(c2)
-    ax.text(-1.5, 1.85, "A-axis\nCeiling-5", ha="center",
-            fontsize=12, fontweight="bold", color="navy")
-    ax.text(-1.5, 0.0, "{4, 5, 14,\n41, 42}", ha="center", fontsize=10)
-    ax.text(-1.5, -0.85, "5 prompts\n(inference\ncannot rescue)", ha="center",
-            fontsize=9, color="navy")
-    ax.text(1.5, 2.7, "T6 hardset", ha="center",
-            fontsize=12, fontweight="bold", color="darkred")
-    ax.text(1.5, 0.4, "166 prompts", ha="center", fontsize=11)
-    ax.text(1.5, -0.4, "training cannot rescue", ha="center", fontsize=9,
-            color="darkred")
-    # empty intersection emphasis
-    ax.annotate("intersect = empty", xy=(0, 0), fontsize=14,
-                fontweight="bold", color="green", ha="center")
-    ax.annotate("(all 5 are rescued by at least one T6 ckpt)", xy=(0, -1.4), fontsize=9,
-                color="green", ha="center", style="italic")
-    ax.text(0, 3.5, "Cross-axis orthogonal:\nthe two ceilings are disjoint → combined > either alone",
-            ha="center", fontsize=11, fontweight="bold")
-    ax.set_xlim(-4.5, 4.5); ax.set_ylim(-2.5, 4.2)
+
+    # Left circle: A-axis Ceiling-5
+    ax.text(LEFT_CTR[0], LEFT_CTR[1] + 1.85, "Inference cannot rescue",
+            ha="center", fontsize=12, fontweight="bold", color="navy")
+    ax.text(LEFT_CTR[0], LEFT_CTR[1] + 0.4, "{4, 5, 14, 41, 42}",
+            ha="center", fontsize=11)
+    ax.text(LEFT_CTR[0], LEFT_CTR[1] - 0.4, "5 prompts",
+            ha="center", fontsize=10, color="navy")
+
+    # Right circle: T6 hardset
+    ax.text(RIGHT_CTR[0], RIGHT_CTR[1] + 2.65, "Training cannot rescue",
+            ha="center", fontsize=12, fontweight="bold", color="darkred")
+    ax.text(RIGHT_CTR[0], RIGHT_CTR[1] + 0.3, "166 prompts",
+            ha="center", fontsize=11)
+    ax.text(RIGHT_CTR[0], RIGHT_CTR[1] - 0.5, "(across 24 trained ckpts)",
+            ha="center", fontsize=9, color="darkred")
+
+    # Touch point of the two circles ≈ between centers
+    intersect_x = (LEFT_CTR[0] + LEFT_R + RIGHT_CTR[0] - RIGHT_R) / 2
+    intersect_y = 0
+    # Tiny ∅ marker at the (empty) intersection
+    ax.scatter([intersect_x], [intersect_y], marker="o", s=220,
+               facecolors="white", edgecolors="green", linewidth=2.5, zorder=5)
+    ax.text(intersect_x, intersect_y, "∅", ha="center", va="center",
+            fontsize=16, color="green", fontweight="bold", zorder=6)
+
+    # Arrow pointing IN to the empty intersection from outside (below)
+    ax.annotate("empty",
+                xy=(intersect_x, intersect_y - 0.18),
+                xytext=(intersect_x, -2.3),
+                fontsize=14, color="green", fontweight="bold", ha="center",
+                arrowprops=dict(arrowstyle="->", color="green", lw=1.8))
+
+    # Title at top
+    ax.text(0, 3.7,
+            "Two ceilings are disjoint → combining axes can break both",
+            ha="center", fontsize=12, fontweight="bold")
+
+    ax.set_xlim(-5, 5.5); ax.set_ylim(-3, 4.4)
     ax.set_aspect("equal")
     ax.axis("off")
     out = FIG_DIR / "cross_axis_venn.png"
