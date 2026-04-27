@@ -264,7 +264,20 @@ Candidate paths (sorted by expected ROI):
 
 ## 6. T7 experiment log (to be filled in)
 
-> ★ T7 v1 (2026-04-26) **FAILED**: pick=shortest selected truncated lucky-correct samples + max_steps=1500 = 6 epochs over-training. fail 27.2% (vs T6 28.1%), ok 88.4% (vs T6 91.6%), net -35.
+> ★ T7 v1 (2026-04-26) **FAILED**: pick=shortest selected truncated lucky-correct samples + max_steps=1500 = 6 epochs over-training.
+>
+> Canonical T=0: fail 27.2% (vs T6 28.1%), ok 88.4% (vs T6 91.6%), net -35.
+>
+> Decode_ablate full scope (completed 2026-04-27): T7 v1 trails T6 best on every metric:
+> | metric | T6 step_336 | T7 v1 | Δ |
+> |---|---|---|---|
+> | greedy fail | 28.1% | 27.2% | -0.9% |
+> | fail pass@8 (oracle, T=1.0) | 65.9% | 59.2% | **-6.7%** |
+> | fail SC@8 (best) | 38.4% | 36.3% | -2.1% |
+> | ok pass@8 | 98.7% | 98.7% | 0 |
+> | ok SC@8 | 95.6% | 93.0% | -2.6% |
+>
+> Key observation: **capacity ceiling itself dropped 7%** (pass@8 from 66→59). Trajectory-level SFT on bad data **actively damaged sampling diversity** — not just failed to collapse into mode.
 >
 > ★ T7 v2 (2026-04-27 planned): repick existing per_prompt with `pick=first` + max_steps=480 (2 epochs). Reuses v1's 1918-prompt cover_rate=95.9% candidates.
 >

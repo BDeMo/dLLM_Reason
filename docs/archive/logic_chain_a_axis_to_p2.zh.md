@@ -264,7 +264,20 @@ oracle (T6 best @ T=1.0 pass@8):     65.9% fail, 98.7% ok    ← 不可部署
 
 ## 6. T7 实验记录区（待回填）
 
-> ★ T7 v1 (2026-04-26) **FAILED**：pick=shortest 选了 truncated 样本 + max_steps=1500 = 6 epoch over-training。fail 27.2%（vs T6 28.1%），ok 88.4%（vs T6 91.6%），net -35。
+> ★ T7 v1 (2026-04-26) **FAILED**：pick=shortest 选了 truncated 样本 + max_steps=1500 = 6 epoch over-training。
+>
+> Canonical T=0：fail 27.2%（vs T6 28.1%），ok 88.4%（vs T6 91.6%），net -35。
+>
+> Decode_ablate full scope（2026-04-27 跑完）：T7 v1 vs T6 best 在所有维度都差：
+> | metric | T6 step_336 | T7 v1 | Δ |
+> |---|---|---|---|
+> | greedy fail | 28.1% | 27.2% | -0.9% |
+> | fail pass@8 (oracle, T=1.0) | 65.9% | 59.2% | **-6.7%** |
+> | fail SC@8 (best) | 38.4% | 36.3% | -2.1% |
+> | ok pass@8 | 98.7% | 98.7% | 0 |
+> | ok SC@8 | 95.6% | 93.0% | -2.6% |
+>
+> 关键观察：**capacity 上限本身被压低 7%**（pass@8 从 66 → 59）。意味着 trajectory-level SFT 用垃圾数据**主动伤害了 sampling diversity**，不只是没 collapse 进 mode。
 >
 > ★ T7 v2 (2026-04-27 计划)：repick existing per_prompt with `pick=first` + max_steps=480（2 epoch）。复用 v1 的 1918-prompt cover_rate=95.9% 的 candidates。
 >
