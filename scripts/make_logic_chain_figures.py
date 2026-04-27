@@ -327,10 +327,10 @@ def fig_cross_axis_venn():
 
     # Arrow points from below to the tangent point (x=0, y=0)
     TOUCH_X = 0
-    ax.annotate("empty",
+    ax.annotate("intersection is empty",
                 xy=(TOUCH_X, 0),
                 xytext=(TOUCH_X, -2.6),
-                fontsize=15, color="green", fontweight="bold", ha="center",
+                fontsize=14, color="green", fontweight="bold", ha="center",
                 arrowprops=dict(arrowstyle="->", color="green", lw=2))
 
     ax.text(0, 3.7,
