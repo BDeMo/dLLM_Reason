@@ -279,19 +279,25 @@ Candidate paths (sorted by expected ROI):
 >
 > Key observation: **capacity ceiling itself dropped 7%** (pass@8 from 66→59). Trajectory-level SFT on bad data **actively damaged sampling diversity** — not just failed to collapse into mode.
 >
-> ★ T7 v2 (2026-04-27 planned): repick existing per_prompt with `pick=first` + max_steps=480 (2 epochs). Reuses v1's 1918-prompt cover_rate=95.9% candidates.
+> ★ T7 v2 (2026-04-27) **DEAD (verdict)**: pick=first + max_steps=480 fixed v1's two bugs, but SC@N actually got worse than v1.
 >
-> ★ T7 v2 numbers (fill in after run):
-> - canonical T=0 pass@1: ?
-> - canonical ok retention: ?
-> - decode_ablate pass@8 ceiling: ?
-> - SC@8 best: ?
-> - net delta vs T6: ?
+> Canonical T=0: fail 27.5% (vs T6 28.1%), ok 90.5% (vs T6 91.6%), FAIL18=2/18 (T6=7/18), ceiling=1/5 (T6=3/5).
 >
-> ★ Next-step decision criterion:
-> - if T7 fail ≥ 45% → success path, T7 becomes the new prod baseline
-> - if 32% < T7 fail < 45% → partial, sweep epoch / try other gen_ckpt
-> - if T7 fail < 32% → self-distill is dead, switch to ORM / RL
+> Decode_ablate full scope:
+> | metric | T6 step_336 | T7 v1 | T7 v2 |
+> |---|---|---|---|
+> | greedy fail | 28.1% | 27.2% | 27.5% |
+> | pass@8 (T=1, oracle) | **65.9%** | 59.2% | **56.8%** |
+> | SC@8 best (deploy) | **38.4%** | 36.3% | **29.6%** |
+> | ok SC@8 (T=1) | 95.6% | 93.0% | 93.0% |
+>
+> Counterintuitive finding: v2 fixed both v1 bugs but SC@N **dropped 6.7% vs v1**. Two hypotheses:
+> 1. `pick=first` always picks T=0.7 sample 0 → SFT data is uniformly "greedy-style" → narrows model into a single tight mode; on fail prompts this mode happens to be wrong.
+> 2. Self-distill only ingests positive samples; the model never learns "what NOT to do". Distribution narrows but the wrong mode isn't actively suppressed.
+>
+> **Decision tree**: fail pass@1 = 27.5% < 32% → **self-distill is dead**, switch to ORM / DPO / PRM-RL.
+>
+> Next step: **ORM-BoN** (cheapest, reuses T7 v1/v2 per_prompt's positive-and-negative samples, ~1-2 days).
 
 ---
 

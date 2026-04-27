@@ -279,19 +279,25 @@ oracle (T6 best @ T=1.0 pass@8):     65.9% fail, 98.7% ok    ← 不可部署
 >
 > 关键观察：**capacity 上限本身被压低 7%**（pass@8 从 66 → 59）。意味着 trajectory-level SFT 用垃圾数据**主动伤害了 sampling diversity**，不只是没 collapse 进 mode。
 >
-> ★ T7 v2 (2026-04-27 计划)：repick existing per_prompt with `pick=first` + max_steps=480（2 epoch）。复用 v1 的 1918-prompt cover_rate=95.9% 的 candidates。
+> ★ T7 v2 (2026-04-27) **DEAD (verdict)**：pick=first + max_steps=480 修了 v1 两个 bug，但 SC@N 反而比 v1 更差。
 >
-> ★ T7 v2 数字（待跑完回填）：
-> - canonical T=0 pass@1: ?
-> - canonical ok retention: ?
-> - decode_ablate pass@8 ceiling: ?
-> - SC@8 best: ?
-> - 与 T6 net delta: ?
+> Canonical T=0：fail 27.5%（vs T6 28.1%），ok 90.5%（vs T6 91.6%），FAIL18=2/18 (T6=7/18)，ceiling=1/5 (T6=3/5)。
 >
-> ★ 决定下一步的判据：
-> - if T7 fail ≥ 45% → success path，T7 当 prod baseline
-> - if 32% < T7 fail < 45% → partial，扫 epoch / 换 gen_ckpt
-> - if T7 fail < 32% → self-distill 死，切 ORM / RL 路线
+> Decode_ablate full scope：
+> | metric | T6 step_336 | T7 v1 | T7 v2 |
+> |---|---|---|---|
+> | greedy fail | 28.1% | 27.2% | 27.5% |
+> | pass@8 (T=1, oracle) | **65.9%** | 59.2% | **56.8%** |
+> | SC@8 best (deploy) | **38.4%** | 36.3% | **29.6%** |
+> | ok SC@8 (T=1) | 95.6% | 93.0% | 93.0% |
+>
+> 关键反直觉观察：v2 修了 v1 的两个 bug 后，SC@N 反而**降了 6.7% 比 v1 更差**。可能的解释：
+> 1. `pick=first` 选 T=0.7 sample 0 → SFT 数据全是"模型贪心风格" → 同质化，collapse 到单一窄模式，且这个模式在 fail 上偏错
+> 2. self-distill 只灌正样本，模型学不到"什么不该做"；分布拉窄但错 mode 没消除
+>
+> **决策树**：fail pass@1 = 27.5% < 32% → self-distill **路死**，切 ORM / DPO / PRM-RL。
+>
+> 下一步：**ORM-BoN**（最便宜，复用 T7 v1/v2 per_prompt 里的正负样本对，~1-2 天）。
 
 ---
 
