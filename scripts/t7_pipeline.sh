@@ -29,6 +29,7 @@ N_SAMPLES=8
 GEN_LENGTH=192
 BLOCK_LENGTH=32
 PICK="first"                                             # 'first' avoids short-truncation bias
+PROMPT_BATCH=4                                           # halved from 8 — OOM-safe at gen_length=192
 SFT_GPUS=8
 EVAL_GPUS=8
 # 2 epochs default (sweet spot from T6 ablate). 1 epoch = train_size/8 steps
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --gen_length)   GEN_LENGTH="$2"; shift 2 ;;
         --pick)         PICK="$2"; shift 2 ;;
         --gen_gpus)     GEN_GPUS="$2"; shift 2 ;;
+        --prompt_batch) PROMPT_BATCH="$2"; shift 2 ;;
         --sft_gpus)     SFT_GPUS="$2"; shift 2 ;;
         --eval_gpus)    EVAL_GPUS="$2"; shift 2 ;;
         --max_train)    T7_MAX_STEPS="$2"; shift 2 ;;
@@ -118,7 +120,7 @@ if [[ "$SKIP_GEN" -eq 0 ]]; then
             --run_dir "$GEN_RUN" \
             --resume \
             --prompt_shard "$s/$GEN_GPUS" \
-            --prompt_batch auto \
+            --prompt_batch "$PROMPT_BATCH" \
             > "$LOG" 2>&1 &
         PIDS+=($!)
         echo "[T7][A]   shard $s/$GEN_GPUS on GPU $s → $LOG"
