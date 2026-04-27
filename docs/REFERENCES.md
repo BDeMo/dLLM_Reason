@@ -75,3 +75,24 @@ All baselines, benchmarks, search methods, and RL algorithms used in dLLM-Reason
 | MDLM | Absorbing-state continuous-time diffusion | Sahoo et al., "Simple and Effective Masked Diffusion Language Models", 2024. [[arXiv:2406.07524]](https://arxiv.org/abs/2406.07524) |
 | SEDD | Score-entropy discrete diffusion | Lou et al., "Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution", 2024. [[arXiv:2310.16834]](https://arxiv.org/abs/2310.16834) |
 | D3PM | Discrete-time structured transitions | Austin et al., "Structured Denoising Diffusion Models in Discrete State-Spaces", NeurIPS 2021. [[arXiv:2107.03006]](https://arxiv.org/abs/2107.03006) |
+
+---
+
+## Verifier / Reward Model / Best-of-N
+
+After T7 self-distill failed (v1.6.2 §6 of `archive/logic_chain_a_axis_to_p2.md`),
+we pivot to outcome-supervised verifiers (ORM) + Best-of-N selection.
+
+| Method | Description | Reference |
+|--------|-------------|-----------|
+| **ORM** (Outcome Reward Model) | Binary classifier: input `(prompt, full output)` → P(correct). BoN picks the highest-scoring of N samples. The original verifier paper for gsm8k. | Cobbe, Kosaraju, Bavarian, Chen, Jun, Kaiser, Plappert, Tworek, Hilton, Nakano, Hesse, Schulman. "Training Verifiers to Solve Math Word Problems", 2021. [[arXiv:2110.14168]](https://arxiv.org/abs/2110.14168) |
+| **PRM** (Process Reward Model) | Step-level scorer: input `(prompt, partial trace)` → P(remaining steps correct). Substantially beats ORM on Math/GSM8K (~+6-12%). | Lightman, Kosaraju, Burda, Edwards, Baker, Lee, Leike, Schulman, Sutskever, Cobbe. "Let's Verify Step by Step", ICLR 2024. [[arXiv:2305.20050]](https://arxiv.org/abs/2305.20050) |
+| **Math-Shepherd** | PRM trained without human step-level labels: estimates per-step value via Monte-Carlo rollouts to GT. | Wang, Li, Shao, Xu, Dai, Li, Guo, Liu, Sui. "Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations", 2024. [[arXiv:2312.08935]](https://arxiv.org/abs/2312.08935) |
+| **OVM** (Outcome-supervised Value Model) | Bridge between ORM and PRM: train value head per partial trajectory but supervised by final outcome only. | Yu, Gao, Wang. "OVM, Outcome-supervised Value Models for Planning in Mathematical Reasoning", NAACL 2024. [[arXiv:2311.09724]](https://arxiv.org/abs/2311.09724) |
+| **V-STaR** | Joint self-distill SFT + verifier: training data = pos samples for SFT, both pos+neg for ORM. Mirrors our T7+ORM pipeline. | Hosseini, Yuan, Malkin, Courville, Sordoni, Agarwal. "V-STaR: Training Verifiers for Self-Taught Reasoners", COLM 2024. [[arXiv:2402.06457]](https://arxiv.org/abs/2402.06457) |
+| **Self-Consistency (SC)** | Deployable counterpart of pass@N: sample N times, return mode of extracted answers. Used as the reference deployable metric in our P2 stage. | Wang, Wei, Schuurmans, Le, Chi, Narang, Chowdhery, Zhou. "Self-Consistency Improves Chain of Thought Reasoning in Language Models", ICLR 2023. [[arXiv:2203.11171]](https://arxiv.org/abs/2203.11171) |
+| **Best-of-N w/ scorer** | Inference-time: sample N, score each, take argmax. Generalises SC (scorer = mode-frequency) and ORM-BoN (scorer = ORM logit). | Established in Nakano et al., "WebGPT: Browser-assisted question-answering with human feedback", 2021. [[arXiv:2112.09332]](https://arxiv.org/abs/2112.09332) — popularised the BoN evaluation setup. |
+
+### Picked references for our v1.6.3 ORM implementation
+
+We follow the **V-STaR** recipe most closely (joint pos/neg supervision, self-generated data) but use the **Cobbe 2021 ORM head architecture** (single linear classifier over the last hidden state). PRM-RL (Lightman 2023 / Math-Shepherd 2024) is parked as v1.7+ work.
