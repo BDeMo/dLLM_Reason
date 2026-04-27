@@ -298,9 +298,11 @@ def fig_cross_axis_venn():
     fig, ax = plt.subplots(figsize=(10, 6))
     from matplotlib.patches import Circle
 
-    # SEPARATE circles (clear gap between) — the visual fact = disjoint
-    LEFT_CTR = (-3.2, 0); LEFT_R = 1.5
-    RIGHT_CTR = (3.2, 0); RIGHT_R = 2.2
+    # Touching (tangent) circles: right edge of left = left edge of right.
+    # Single touch point at x=0 — geometrically still ∩=∅ (a point has
+    # measure zero) and visually "they touch but don't overlap".
+    LEFT_CTR = (-1.5, 0); LEFT_R = 1.5
+    RIGHT_CTR = (2.2, 0); RIGHT_R = 2.2
     c1 = Circle(LEFT_CTR, LEFT_R, alpha=0.35, color="tab:blue", linewidth=2,
                 edgecolor="navy")
     c2 = Circle(RIGHT_CTR, RIGHT_R, alpha=0.35, color="tab:red", linewidth=2,
@@ -323,21 +325,19 @@ def fig_cross_axis_venn():
     ax.text(RIGHT_CTR[0], RIGHT_CTR[1] - 0.5, "(across 24 trained ckpts)",
             ha="center", fontsize=9, color="darkred")
 
-    # Arrow from below pointing into the gap between circles, label "empty"
-    # (no target marker — the arrow simply points to nothing)
-    GAP_X = 0  # midpoint of the gap (well outside both circles)
+    # Arrow points from below to the tangent point (x=0, y=0)
+    TOUCH_X = 0
     ax.annotate("empty",
-                xy=(GAP_X, 0),
-                xytext=(GAP_X, -2.4),
+                xy=(TOUCH_X, 0),
+                xytext=(TOUCH_X, -2.6),
                 fontsize=15, color="green", fontweight="bold", ha="center",
                 arrowprops=dict(arrowstyle="->", color="green", lw=2))
 
-    # Title
     ax.text(0, 3.7,
             "Two ceilings are disjoint → combining axes can break both",
             ha="center", fontsize=12, fontweight="bold")
 
-    ax.set_xlim(-6, 6.5); ax.set_ylim(-3, 4.4)
+    ax.set_xlim(-4, 5); ax.set_ylim(-3.2, 4.4)
     ax.set_aspect("equal")
     ax.axis("off")
     out = FIG_DIR / "cross_axis_venn.png"
