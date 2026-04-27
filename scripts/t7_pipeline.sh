@@ -200,11 +200,23 @@ python scripts/validate/v16_eval.py \
 cat "$EVAL_OUT/comparison.md"
 
 echo "[T7][D] decode_ablate on T7 ..."
+T7_DECODE_DIR="$ROOT/runs/validation/t6_decode_ablate/${T7_RUN_NAME}_hf"
 bash scripts/t6_decode_ablate.sh \
     --ckpt "$T7_DIR/hf" \
     --auto_gpus \
     --prompt_batch 8 \
     2>&1 | tee "$LOG_DIR/t7_decode_ablate_${TS}.log"
+
+# Phase D.3: SC post-process (deployable metric vs oracle pass@N)
+echo "[T7][D] SC post-processing ..."
+python scripts/t6_self_consistency.py --dir "$T7_DECODE_DIR" || true
+
+echo
+echo "════════ Pareto: pass@N (oracle) ════════"
+cat "$T7_DECODE_DIR/summary.md" 2>/dev/null
+echo
+echo "════════ SC@N (deployable) ════════"
+cat "$T7_DECODE_DIR/sc_summary.md" 2>/dev/null
 
 echo
 echo "[T7] ════════════════ DONE ════════════════"
