@@ -85,7 +85,7 @@ def main():
     print(f"[ORM] loading {args.model} ...")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
-                                      torch_dtype=torch.bfloat16).cuda().eval()
+                                      dtype=torch.bfloat16).cuda().eval()
     mask_id = _get_mask_token_id(model, tok)
 
     # Probe attn_mask once

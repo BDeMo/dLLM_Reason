@@ -66,7 +66,11 @@ def main():
     ap.add_argument("--max_seq_len", type=int, default=768)
     ap.add_argument("--pooling", default="last", choices=["last", "mean"])
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--prompt_shard", default="0/1",
+                    help="<idx>/<total> for multi-GPU sharding "
+                         "(prompts where i%total==idx are processed)")
     args = ap.parse_args()
+    SHARD_IDX, SHARD_TOTAL = (int(x) for x in args.prompt_shard.split("/"))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +78,7 @@ def main():
     print(f"[ORM-EVAL] loading base {args.base_ckpt} ...")
     tok = AutoTokenizer.from_pretrained(args.base_ckpt, trust_remote_code=True)
     base = AutoModel.from_pretrained(args.base_ckpt, trust_remote_code=True,
-                                     torch_dtype=torch.bfloat16).cuda().eval()
+                                     dtype=torch.bfloat16).cuda().eval()
     hidden_size = base.config.hidden_size
     mask_id = _get_mask_token_id(base, tok)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -100,30 +104,46 @@ def main():
     # pool last hidden, head.
     @torch.no_grad()
     def orm_score_batch(prompts: list[str], outputs: list[str]) -> list[float]:
-        # Build full text per (prompt, output)
+        # Build full text and remember prompt boundary per (prompt, output)
         texts = []
+        prompt_lens = []
         for p, o in zip(prompts, outputs):
             chat = tok.apply_chat_template(
                 [{"role": "user", "content": p}],
                 add_generation_prompt=True, tokenize=False)
+            prompt_lens.append(len(tok(chat, add_special_tokens=False)["input_ids"]))
             texts.append(chat + o)
         enc = tok(texts, padding=True, truncation=True,
                   max_length=args.max_seq_len, return_tensors="pt").to("cuda")
+        # build output_mask: 1 in answer region (and non-pad)
+        L = enc["input_ids"].shape[1]
+        out_mask = torch.zeros_like(enc["attention_mask"])
+        for i, pl in enumerate(prompt_lens):
+            if pl < L:
+                out_mask[i, pl:] = 1
+        out_mask = out_mask * enc["attention_mask"]
         if ATTN_OK:
             out = base(enc["input_ids"], attention_mask=enc["attention_mask"],
                        output_hidden_states=True)
         else:
             out = base(enc["input_ids"], output_hidden_states=True)
         hidden = out.hidden_states[-1] if hasattr(out, "hidden_states") and out.hidden_states else out.last_hidden_state
-        logits = head(hidden, attention_mask=enc["attention_mask"]).float()
+        logits = head(hidden, attention_mask=enc["attention_mask"],
+                      output_mask=out_mask).float()
         return logits.tolist()
 
     # Load scopes
-    fail = json.loads(Path(args.scope_fail).read_text(encoding="utf-8"))[: args.n_fail]
-    ok   = json.loads(Path(args.scope_ok).read_text(encoding="utf-8"))[: args.n_ok]
-    todo = [("fail", i, r) for i, r in enumerate(fail)] + \
-           [("ok",   i, r) for i, r in enumerate(ok)]
-    print(f"[ORM-EVAL] scope: fail={len(fail)}  ok={len(ok)}  total={len(todo)}")
+    fail_all = json.loads(Path(args.scope_fail).read_text(encoding="utf-8"))
+    ok_all   = json.loads(Path(args.scope_ok).read_text(encoding="utf-8"))
+    fail = fail_all[: args.n_fail] if args.n_fail > 0 else fail_all
+    ok   = ok_all[: args.n_ok]   if args.n_ok   > 0 else ok_all
+    todo_all = [("fail", i, r) for i, r in enumerate(fail)] + \
+               [("ok",   i, r) for i, r in enumerate(ok)]
+    # shard by global index
+    todo = [t for k, t in enumerate(todo_all)
+            if k % SHARD_TOTAL == SHARD_IDX]
+    print(f"[ORM-EVAL] shard {SHARD_IDX}/{SHARD_TOTAL}: "
+          f"fail={len(fail)}  ok={len(ok)}  shard_n={len(todo)}/{len(todo_all)}")
 
     P_BATCH = 4 if args.prompt_batch == "auto" else int(args.prompt_batch)
 
@@ -204,10 +224,10 @@ def main():
         print(f"[ORM-EVAL] chunk {chunk_start//P_BATCH+1}/"
               f"{(len(todo)+P_BATCH-1)//P_BATCH} done")
 
-    # Aggregate
-    def pct(n, d): return f"{100*n/max(d,1):.1f}% ({n}/{d})"
-    summary = {
+    # Per-shard partial summary (final aggregation happens in pipeline)
+    shard_summary = {
         "config": vars(args),
+        "shard": f"{SHARD_IDX}/{SHARD_TOTAL}",
         "fail": {
             "n":      n_total["fail"],
             "greedy": n_correct_greedy["fail"],
@@ -223,24 +243,10 @@ def main():
             "pass@N": n_correct_pass["ok"],
         },
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False))
-
-    md = ["# ORM BoN evaluation",
-          "",
-          f"base: `{args.base_ckpt}`",
-          f"head: `{args.orm_head}`",
-          f"N samples: {args.n_samples}, T: {args.temperature}",
-          "",
-          "| metric | fail rescue | ok retention |",
-          "|---|---|---|"]
-    for m in ("greedy", "SC@N", "BoN@N", "pass@N"):
-        md.append(f"| {m} | {pct(summary['fail'][m], summary['fail']['n'])} "
-                  f"| {pct(summary['ok'][m], summary['ok']['n'])} |")
-    (out_dir / "summary.md").write_text("\n".join(md), encoding="utf-8")
-    print()
-    print("\n".join(md))
-    print(f"\n[ORM-EVAL] → {out_dir}")
+    (out_dir / f"summary_shard{SHARD_IDX}.json").write_text(
+        json.dumps(shard_summary, indent=2, ensure_ascii=False))
+    print(f"[ORM-EVAL] shard {SHARD_IDX}/{SHARD_TOTAL} done → "
+          f"{out_dir}/summary_shard{SHARD_IDX}.json")
 
 
 if __name__ == "__main__":

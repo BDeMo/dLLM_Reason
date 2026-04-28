@@ -30,9 +30,10 @@ PROMPT_BATCH=4
 ORM_MAX_STEPS=2000
 ORM_LR=1e-4
 ORM_BATCH_SIZE=8
+ORM_POOLING=mean    # "last" or "mean" — mean over output region (recommended for diffusion bidirectional model)
 
-EVAL_N_FAIL=331
-EVAL_N_OK=200
+EVAL_N_FAIL=0   # 0 = all fail prompts
+EVAL_N_OK=0     # 0 = all ok prompts (full retention measurement)
 
 SKIP_COLLECT=0
 JSONL_OVERRIDE=""
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --max_steps)    ORM_MAX_STEPS="$2"; shift 2 ;;
         --lr)           ORM_LR="$2"; shift 2 ;;
         --batch_size)   ORM_BATCH_SIZE="$2"; shift 2 ;;
+        --pooling)      ORM_POOLING="$2"; shift 2 ;;
         --n_fail)       EVAL_N_FAIL="$2"; shift 2 ;;
         --n_ok)         EVAL_N_OK="$2"; shift 2 ;;
         --skip_collect) SKIP_COLLECT=1; shift ;;
@@ -113,9 +115,9 @@ else
     echo "[ORM] reuse jsonl: $JSONL"
 fi
 
-# ── Phase C: train ORM head ─────────────────────────────────────────────
-echo "[ORM][C] training head ..."
-CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u \
+# ── Phase C: train ORM head (DDP, 8-GPU) ────────────────────────────────
+echo "[ORM][C] training head (DDP × $GEN_GPUS GPU) ..."
+PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node="$GEN_GPUS" \
     scripts/orm_train.py \
     --base_ckpt "$BASE_CKPT" \
     --train_jsonl "$JSONL" \
@@ -123,21 +125,37 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u \
     --max_steps "$ORM_MAX_STEPS" \
     --batch_size "$ORM_BATCH_SIZE" \
     --lr "$ORM_LR" \
+    --pooling "$ORM_POOLING" \
     2>&1 | tee "$LOG_DIR/orm_train_${TS}.log"
 
 HEAD_CKPT="$TRAIN_DIR/head_final.pt"
 [[ ! -f "$HEAD_CKPT" ]] && { echo "[ORM] ERROR: head training failed"; exit 1; }
 
-# ── Phase D: BoN eval ───────────────────────────────────────────────────
-echo "[ORM][D] BoN eval on scope_fail + scope_ok ..."
-CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u \
-    scripts/orm_eval_bon.py \
-    --base_ckpt "$BASE_CKPT" \
-    --orm_head "$HEAD_CKPT" \
-    --n_samples "$N_SAMPLES" \
-    --temperature "$TEMPERATURE" \
-    --n_fail "$EVAL_N_FAIL" --n_ok "$EVAL_N_OK" \
-    --out_dir "$EVAL_DIR" \
+# ── Phase D: BoN eval, $GEN_GPUS shards in parallel ────────────────────
+echo "[ORM][D] BoN eval — $GEN_GPUS shards"
+mkdir -p "$EVAL_DIR"
+declare -a EVAL_PIDS=()
+for ((s=0; s<GEN_GPUS; s++)); do
+    LOG="$LOG_DIR/orm_eval_shard${s}_${TS}.log"
+    CUDA_VISIBLE_DEVICES=$s PYTHONUNBUFFERED=1 python -u \
+        scripts/orm_eval_bon.py \
+        --base_ckpt "$BASE_CKPT" \
+        --orm_head "$HEAD_CKPT" \
+        --n_samples "$N_SAMPLES" \
+        --temperature "$TEMPERATURE" \
+        --n_fail "$EVAL_N_FAIL" --n_ok "$EVAL_N_OK" \
+        --prompt_shard "$s/$GEN_GPUS" \
+        --pooling "$ORM_POOLING" \
+        --out_dir "$EVAL_DIR" \
+        > "$LOG" 2>&1 &
+    EVAL_PIDS+=($!)
+done
+for i in "${!EVAL_PIDS[@]}"; do
+    wait "${EVAL_PIDS[$i]}" || echo "[ORM][D] eval shard $i FAILED"
+done
+
+echo "[ORM][D] aggregating shard summaries ..."
+python -u scripts/orm_eval_aggregate.py --eval_dir "$EVAL_DIR" \
     2>&1 | tee "$LOG_DIR/orm_eval_${TS}.log"
 
 # ── Phase E: print summary ─────────────────────────────────────────────
