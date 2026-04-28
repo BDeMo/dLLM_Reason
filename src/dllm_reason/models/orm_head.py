@@ -74,6 +74,11 @@ class ORMHead(nn.Module):
         else:
             raise ValueError(f"unknown pooling: {self.pooling}")
 
+        # Cast to fp32 — base may run bf16; classifier weights are fp32 for
+        # BCE numerical stability. This avoids the
+        #   "mat1 and mat2 must have the same dtype, BFloat16 vs Float"
+        # error when base model returns bf16 hidden states.
+        pooled = pooled.float()
         pooled = self.dropout(pooled)
         return self.classifier(pooled).squeeze(-1)              # (B,)
 
