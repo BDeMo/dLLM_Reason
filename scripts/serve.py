@@ -12,6 +12,7 @@ API endpoints:
     POST /batch_generate            — batch generate (multiple prompts, single strategy)
     POST /generate_span_revise      — A3: block denoise + sliding-window revise hook
     POST /generate_block_schedule   — A4: explicit per-block (size, steps) schedule
+    POST /generate_bon              — P2.C: Best-of-N with ORM verifier (recommended default)
     POST /switch_model              — hot-swap the loaded model
     GET  /strategies                — list available strategies
     GET  /info                      — model info (id, device, dtype)
@@ -37,6 +38,12 @@ app = FastAPI(title="dLLM-Reason", version="1.6.0")
 # Global model reference (loaded at startup)
 _model = None
 _model_id = ""
+
+# ORM verifier head (loaded if --orm_head passed at startup, or lazy-loaded
+# from per-request override). See docs/archive/finding_p2c_orm_bon.md.
+_orm_head = None
+_orm_head_path = ""
+_orm_pooling = "mean"
 
 
 class GenerateRequest(BaseModel):
@@ -333,6 +340,173 @@ def generate_inpaint_endpoint(req: InpaintRequest):
     )
 
 
+# ── P2.C: Best-of-N with ORM verifier ────────────────────────────────────────
+#
+# Recommended default decode strategy (see docs/archive/finding_p2c_orm_bon.md).
+# Result on T6/gsm8k:
+#   greedy 33.8% / SC@8 39.6% / BoN@8 49.2% / pass@8 65.0% (oracle)
+#
+# IMPORTANT: the ORM head is base-model-specific. If you swap the base
+# (different ckpt / different SFT / different architecture), retrain via:
+#   bash scripts/orm_pipeline.sh --base_ckpt <new_ckpt> --pooling mean
+# Pipeline is ~1h end-to-end on 8 GPU. Without --orm_head, this endpoint
+# falls back to SC@N (majority vote) — still beats greedy by ~5pp.
+
+
+def _ensure_orm_head(head_path: str | None = None, pooling: str | None = None):
+    """Load ORM head on demand. Returns the head module or None if unavailable."""
+    global _orm_head, _orm_head_path, _orm_pooling
+    target_path = head_path or _orm_head_path
+    target_pool = pooling or _orm_pooling
+    if not target_path:
+        return None
+    if _orm_head is not None and target_path == _orm_head_path \
+            and target_pool == _orm_pooling:
+        return _orm_head
+
+    import sys
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    from dllm_reason.models.orm_head import ORMHead
+
+    hidden_size = _model._llada.config.hidden_size
+    head = ORMHead(hidden_size, pooling=target_pool)
+    head.load_state_dict(torch.load(target_path, map_location=_model.device))
+    head.to(_model.device).eval()
+    _orm_head = head
+    _orm_head_path = target_path
+    _orm_pooling = target_pool
+    print(f"[BoN] ORM head loaded: {target_path}  (pooling={target_pool})")
+    return _orm_head
+
+
+def _bon_score(prompts: list[str], outputs: list[str]) -> list[float]:
+    """Score (prompt, output) pairs with the loaded ORM head."""
+    tok = _model.tokenizer
+    base = _model._llada
+    texts, prompt_lens = [], []
+    for p, o in zip(prompts, outputs):
+        chat = tok.apply_chat_template(
+            [{"role": "user", "content": p}],
+            add_generation_prompt=True, tokenize=False)
+        prompt_lens.append(len(tok(chat, add_special_tokens=False)["input_ids"]))
+        texts.append(chat + o)
+    enc = tok(texts, padding=True, truncation=True, max_length=768,
+              return_tensors="pt").to(_model.device)
+    L = enc["input_ids"].shape[1]
+    out_mask = torch.zeros_like(enc["attention_mask"])
+    for i, pl in enumerate(prompt_lens):
+        if pl < L:
+            out_mask[i, pl:] = 1
+    out_mask = out_mask * enc["attention_mask"]
+    with torch.no_grad():
+        try:
+            base_out = base(enc["input_ids"], attention_mask=enc["attention_mask"],
+                            output_hidden_states=True)
+        except TypeError:
+            base_out = base(enc["input_ids"], output_hidden_states=True)
+        hidden = (base_out.hidden_states[-1]
+                  if hasattr(base_out, "hidden_states") and base_out.hidden_states
+                  else base_out.last_hidden_state)
+        logits = _orm_head(hidden, attention_mask=enc["attention_mask"],
+                           output_mask=out_mask).float()
+    return logits.tolist()
+
+
+class BoNRequest(BaseModel):
+    prompt: str
+    n_samples: int = Field(default=8, ge=1, le=32)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0,
+                               description="must be > 0 for sampling diversity")
+    max_new_tokens: int = Field(default=128, ge=1, le=2048)
+    num_steps: int = Field(default=128, ge=1, le=1024)
+    block_length: int = Field(default=32, ge=1, le=512)
+    strategy: str = Field(default="confidence")
+    orm_head: str | None = Field(
+        default=None,
+        description="optional override; if no head loaded and not provided, "
+                    "falls back to SC@N (majority vote)")
+    pooling: str = Field(default="mean", description='"mean" or "last"')
+    return_all: bool = Field(default=False,
+                             description="if true, return all N samples + scores")
+
+
+class BoNResponse(BaseModel):
+    text: str
+    selected_idx: int
+    method: str  # "BoN" or "SC@N (no verifier)"
+    n_samples: int
+    elapsed_seconds: float
+    samples: list[str] | None = None
+    scores: list[float] | None = None
+
+
+@app.post("/generate_bon", response_model=BoNResponse)
+def generate_bon_endpoint(req: BoNRequest):
+    """Best-of-N with ORM verifier (recommended default).
+
+    Samples N traces at the requested temperature, scores each with the
+    loaded ORM head, returns the argmax. Falls back to SC@N (majority
+    vote on extracted answer) if no ORM head is loaded.
+    """
+    import re
+    from collections import Counter
+
+    if _model is None:
+        raise HTTPException(500, "Model not loaded")
+    if req.temperature <= 0:
+        raise HTTPException(400, "BoN needs temperature > 0 for diversity")
+
+    head = _ensure_orm_head(req.orm_head, req.pooling)
+
+    # Sample N
+    t0 = time.time()
+    samples: list[str] = []
+    for _ in range(req.n_samples):
+        scheduler = build_scheduler(
+            req.strategy, req.max_new_tokens, req.block_length, _model.device)
+        text = _model.generate(
+            prompt=req.prompt,
+            generation_len=req.max_new_tokens,
+            block_length=req.block_length,
+            scheduler=scheduler,
+            num_steps=req.num_steps,
+            temperature=req.temperature,
+        )
+        samples.append(text)
+
+    # Score
+    if head is not None:
+        scores = _bon_score([req.prompt] * req.n_samples, samples)
+        best_i = int(max(range(req.n_samples), key=lambda j: scores[j]))
+        method = "BoN"
+    else:
+        # SC@N fallback: majority vote on last numeric span
+        def extract(s):
+            nums = re.findall(r"-?\d+(?:,\d+)*(?:\.\d+)?", str(s or ""))
+            return nums[-1].replace(",", "") if nums else None
+        ans = [extract(s) for s in samples]
+        ans_clean = [a for a in ans if a is not None]
+        if ans_clean:
+            mode_a = Counter(ans_clean).most_common(1)[0][0]
+            best_i = next(i for i, a in enumerate(ans) if a == mode_a)
+        else:
+            best_i = 0
+        scores = None
+        method = "SC@N (no verifier)"
+
+    return BoNResponse(
+        text=samples[best_i],
+        selected_idx=best_i,
+        method=method,
+        n_samples=req.n_samples,
+        elapsed_seconds=round(time.time() - t0, 3),
+        samples=samples if req.return_all else None,
+        scores=scores if req.return_all else None,
+    )
+
+
 # ── Model hot-swap ───────────────────────────────────────────────────────────
 
 
@@ -353,10 +527,16 @@ def switch_model(req: SwitchModelRequest):
         "float32": torch.float32,
     }
 
-    # Free current model
+    # Free current model + invalidate ORM head (head is base-specific)
+    global _orm_head, _orm_head_path
     if _model is not None:
         del _model
         torch.cuda.empty_cache()
+    if _orm_head is not None:
+        print("[BoN] base swapped → invalidating ORM head "
+              "(retrain via scripts/orm_pipeline.sh for the new base)")
+        _orm_head = None
+        _orm_head_path = ""
 
     quant_config = None
     if req.quantize == "4bit":
@@ -414,9 +594,20 @@ def main():
                         help="Load model with quantization (requires bitsandbytes)")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16",
                         choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--orm_head", type=str, default=None,
+                        help="Path to ORM head .pt for /generate_bon. "
+                             "Must be trained on the same base "
+                             "(scripts/orm_pipeline.sh). If omitted, "
+                             "/generate_bon falls back to SC@N.")
+    parser.add_argument("--orm_pooling", type=str, default="mean",
+                        choices=["mean", "last"],
+                        help='ORM pooling — "mean" recommended for LLaDA')
     args = parser.parse_args()
 
     _model_id = args.model_id
+    global _orm_head_path, _orm_pooling
+    _orm_head_path = args.orm_head or ""
+    _orm_pooling = args.orm_pooling
 
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -450,6 +641,15 @@ def main():
     )
 
     print(f"Model loaded on {_model.device}, serving at {args.host}:{args.port}")
+    if args.orm_head:
+        try:
+            _ensure_orm_head(args.orm_head, args.orm_pooling)
+        except Exception as e:
+            print(f"[BoN] WARNING: failed to load ORM head: {e}\n"
+                  f"      /generate_bon will fall back to SC@N.")
+    else:
+        print("[BoN] no --orm_head set; /generate_bon will fall back to SC@N. "
+              "To enable BoN, train via scripts/orm_pipeline.sh.")
     uvicorn.run(app, host=args.host, port=args.port)
 
 
